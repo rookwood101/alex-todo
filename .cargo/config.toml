@@ -1,0 +1,7 @@
+[env]
+# This machine's %TEMP% denies file creation to child processes, which breaks
+# MSVC C compilation (bundled SQLite) and temp-writing tests. Keep compiler
+# temporaries inside the checkout instead; target/ always exists by the time
+# build scripts run. force = true overrides the inherited TEMP/TMP.
+TMP = { value = "target", relative = true, force = true }
+TEMP = { value = "target", relative = true, force = true }

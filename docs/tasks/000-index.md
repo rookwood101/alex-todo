@@ -230,17 +230,17 @@ These notes record decisions made while executing the plan. They are binding for
   ```
 
   `cargo-clippy` and `cargo-fmt` live in that same folder and are installed.
-- **%TEMP% denies file creation here.** Any C compilation (`libsqlite3-sys`) and any test that
-  writes through `std::env::temp_dir()` fails without this preamble. Point the temp variables at
-  a writable folder inside the checkout first:
+- **%TEMP% denies file creation here.** Any C compilation (`libsqlite3-sys`) fails without a
+  writable temp dir (MSVC `error D8050: cannot execute c1.dll`, or `C1083 ... _CL_...`).
+  `.cargo/config.toml` now forces `TMP`/`TEMP` to `target` for cargo (with `force = true`),
+  so plain `cargo test` works. If a tool is run outside cargo and hits the same error, set the
+  temp variables to a writable folder inside the checkout first:
 
   ```powershell
   $env:TMP = Join-Path (Get-Location) 'target\tmp'
   $env:TEMP = $env:TMP
   New-Item -ItemType Directory -Force -Path $env:TMP | Out-Null
   ```
-
-  Symptom without it: MSVC `error D8050: cannot execute c1.dll` or `C1083 ... _CL_...`.
 - Native-command stderr becomes a PowerShell error; set `$ErrorActionPreference='Continue'` and
   check `$LASTEXITCODE`.
 
