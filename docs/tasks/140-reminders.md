@@ -1,12 +1,15 @@
 # 140 — Reminder thread
 
+> **Read [000-index](000-index.md) first.** It carries the decisions, write-set
+> ownership, dependency graph, and gates this task assumes.
+
 **Goal:** fire reminders while the app is visible or hidden, once per reminder, respecting
 snooze and done. Uses a notifier; does not implement toasts.
 
 **Depends on:** 050 (system batches), 060 (time). **Parallel with:** 150/160.
 **Owns:** `src/remind.rs`, `src/remind` module declaration.
 
-**Read first:** this index; `src/time.rs`; `src/store/**`. Define a one-method
+**Read first:** `src/time.rs`; `src/store/**`. Define a one-method
 `ReminderSink { fn notify(&self, ReminderNotice) }` in this module so the task does not depend on
 150; 170 adapts 150's `Notifier` to it.
 

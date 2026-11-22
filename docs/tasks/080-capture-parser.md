@@ -1,12 +1,15 @@
 # 080 — Capture parser
 
+> **Read [000-index](000-index.md) first.** It carries the decisions, write-set
+> ownership, dependency graph, and gates this task assumes.
+
 **Goal:** turn one typed line into a note plus optional group, priority and deadline chips. Fast,
 local, deterministic — the model is never on this path.
 
 **Depends on:** 060 (`TimeSpec`). **Parallel with:** 040, 050, 070.
 **Owns:** `src/capture.rs`, `src/capture` module declaration. Do not edit UI files.
 
-**Read first:** this index; `src/time.rs`; the existing note text conventions in `src/board.rs`.
+**Read first:** `src/time.rs`; the existing note text conventions in `src/board.rs`.
 
 ## Steps
 

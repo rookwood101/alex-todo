@@ -1,5 +1,8 @@
 # 090 — Capture/Agent composer
 
+> **Read [000-index](000-index.md) first.** It carries the decisions, write-set
+> ownership, dependency graph, and gates this task assumes.
+
 **Goal:** one bottom-centre input with two modes. Capture creates a note instantly on Enter;
 Agent sends a prompt on Enter. Tab switches; chips preview what Capture will set.
 
@@ -7,7 +10,7 @@ Agent sends a prompt on Enter. Tab switches; chips preview what Capture will set
 **Owns:** `src/ui/mod.rs`, `src/ui/composer.rs`; may add one `ui::composer::show(...)` call in
 `src/app.rs` (the only app change; 170 consolidates).
 
-**Read first:** this index; `src/app.rs` panel structure; `src/capture.rs`; the existing
+**Read first:** `src/app.rs` panel structure; `src/capture.rs`; the existing
 `TextEdit` usage in `src/canvas.rs`.
 
 ## Steps

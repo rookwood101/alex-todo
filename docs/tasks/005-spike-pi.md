@@ -1,12 +1,15 @@
 # 005 — Spike: Pi RPC on this machine
 
+> **Read [000-index](000-index.md) first.** It carries the decisions, write-set
+> ownership, dependency graph, and gates this task assumes.
+
 **Goal:** prove Pi's RPC mode works here and lock the exact command lines for board mode and
 power mode. This is a timeboxed investigation, not the bridge. Deliver findings, then stop.
 
 **Depends on:** nothing. **Parallel with:** 010, 020.
 **Owns:** `docs/tasks/005-findings.md`, `scripts/pi-smoke.ps1` (optional). Do not touch `src/`.
 
-**Read first:** this index; [Pi CLI integration](https://docs.pi.dev/latest/cli-integration),
+**Read first:** [Pi CLI integration](https://docs.pi.dev/latest/cli-integration),
 [RPC](https://docs.pi.dev/latest/rpc), [RPC commands](https://docs.pi.dev/latest/rpc-commands),
 [MCP](https://docs.pi.dev/latest/mcp), [security](https://docs.pi.dev/latest/security).
 

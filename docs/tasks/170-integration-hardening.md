@@ -1,5 +1,8 @@
 # 170 — Integration, legacy removal, hardening
 
+> **Read [000-index](000-index.md) first.** It carries the decisions, write-set
+> ownership, dependency graph, and gates this task assumes.
+
 **Goal:** make the real app use everything built so far: SQLite read models, commands, undo,
 composer, chat, reminders, tray/hotkey, toasts. Delete the RON persistence path. Ship a green,
 signed build.
@@ -8,13 +11,13 @@ signed build.
 `src/headless_tests.rs`, `README.md`, `scripts/build.ps1`; deletes `src/persist.rs` and
 `src/board.rs`; touches `Cargo.toml` to drop `ron`.
 
-**Read first:** this index; every module's public API; `scripts/build.ps1`; `src/headless_tests.rs`.
+**Read first:** every module's public API; `scripts/build.ps1`; `src/headless_tests.rs`.
 
 ## Steps
 
 1. `config.rs`: `config.json` in the board home with `hotkey`, `board_db`, `tz`, `pi_model`,
-   `pi_profile`, `reminder_minutes`. Defaults per this index. Invalid config falls back to
-   defaults with a logged warning, never a panic.
+   `pi_profile`, `reminder_minutes`. Defaults per [000-index](000-index.md). Invalid config
+   falls back to defaults with a logged warning, never a panic.
 2. Rewire `RustboardApp`: hold `Store`, `model::Board`, `layout`, `ComposerState`, `ChatState`,
    `ReminderEngine`, `Platform`, `Notifier`. Load the board on start; if the DB cannot open,
    show an error panel with the path and a Retry button instead of crashing.

@@ -1,12 +1,15 @@
 # 130 — Chat panel above the composer
 
+> **Read [000-index](000-index.md) first.** It carries the decisions, write-set
+> ownership, dependency graph, and gates this task assumes.
+
 **Goal:** show the Pi conversation in the app: streaming text, tool activity, stop, cost, and
 "undo this turn". The transport is 120; this task is presentation and turn bookkeeping.
 
 **Depends on:** 050 (batch range), 120 (events), 090 (composer). **Parallel with:** 150/160.
 **Owns:** `src/ui/chat.rs`; one `ui::chat::show(...)` call in `src/app.rs` (coordinate with 170).
 
-**Read first:** this index; `src/agent/**`; `src/history.rs`; `src/ui/composer.rs`.
+**Read first:** `src/agent/**`; `src/history.rs`; `src/ui/composer.rs`.
 
 ## Steps
 

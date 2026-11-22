@@ -1,12 +1,15 @@
 # 030 — Schema and migrations
 
+> **Read [000-index](000-index.md) first.** It carries the decisions, write-set
+> ownership, dependency graph, and gates this task assumes.
+
 **Goal:** create the real schema: board tables, append-only audit tables, indexes, FTS5, and the
 triggers that enforce the invariants.
 
 **Depends on:** 020. **Parallel with:** 040 planning, 060, 070.
 **Owns:** `migrations/**`, `src/store/schema.rs`. Do not touch app/UI files.
 
-**Read first:** this index (data conventions), `020`'s migration runner, the approved schema in
+**Read first:** `020`'s migration runner, the approved schema in
 the plan. Use `rusqlite` prepared statements and `PRAGMA foreign_keys=ON`.
 
 ## Steps

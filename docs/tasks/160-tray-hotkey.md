@@ -1,5 +1,8 @@
 # 160 — Tray, global hotkey, hide-to-tray
 
+> **Read [000-index](000-index.md) first.** It carries the decisions, write-set
+> ownership, dependency graph, and gates this task assumes.
+
 **Goal:** one Win32 message thread owns the hotkey and tray icon, and the app hides to tray on
 X/Esc instead of exiting. This is what makes Rustboard a background app.
 
@@ -7,7 +10,7 @@ X/Esc instead of exiting. This is what makes Rustboard a background app.
 **Owns:** `src/platform/win32.rs`, `src/platform` module declaration. Add the `windows` and
 `crossbeam-channel` deps in this PR.
 
-**Read first:** `docs/tasks/010-findings.md`; this index; `src/main.rs`; `src/app.rs` viewport
+**Read first:** `docs/tasks/010-findings.md`; `src/main.rs`; `src/app.rs` viewport
 handling.
 
 ## Steps

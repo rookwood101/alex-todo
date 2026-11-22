@@ -1,5 +1,8 @@
 # 120 — Pi RPC bridge
 
+> **Read [000-index](000-index.md) first.** It carries the decisions, write-set
+> ownership, dependency graph, and gates this task assumes.
+
 **Goal:** run Pi as a long-lived child process, stream its events into the app, and keep board
 mode and power mode as two tool profiles. No chat UI here.
 
@@ -7,7 +10,7 @@ mode and power mode as two tool profiles. No chat UI here.
 **Owns:** `src/agent/**`, `src/agent` module declaration, bridge tests. Add no deps beyond
 `serde_json`/`crossbeam-channel` unless 005 requires them.
 
-**Read first:** `docs/tasks/005-findings.md`; this index; [Pi RPC](https://docs.pi.dev/latest/rpc)
+**Read first:** `docs/tasks/005-findings.md`; [Pi RPC](https://docs.pi.dev/latest/rpc)
 and [RPC commands](https://docs.pi.dev/latest/rpc-commands).
 
 ## Steps

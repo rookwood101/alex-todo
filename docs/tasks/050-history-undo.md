@@ -1,5 +1,8 @@
 # 050 — History, soft delete and infinite undo
 
+> **Read [000-index](000-index.md) first.** It carries the decisions, write-set
+> ownership, dependency graph, and gates this task assumes.
+
 **Goal:** make every mutation reversible from append-only audit data, without ever updating or
 deleting a history row. This is the foundation for Ctrl+Z, "undo that agent turn", and
 `board_sql` snapshots.
@@ -7,7 +10,7 @@ deleting a history row. This is the foundation for Ctrl+Z, "undo that agent turn
 **Depends on:** 040. **Parallel with:** 070, 110 planning.
 **Owns:** `src/history.rs`, history tests. Do not add the authorizer here (110).
 
-**Read first:** this index; `040`'s `apply`; `030`'s `batches`/`undo_targets`/`events`/`snapshots`.
+**Read first:** `040`'s `apply`; `030`'s `batches`/`undo_targets`/`events`/`snapshots`.
 
 ## Steps
 

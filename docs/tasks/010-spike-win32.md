@@ -1,5 +1,8 @@
 # 010 — Spike: Win32 shell primitives in eframe
 
+> **Read [000-index](000-index.md) first.** It carries the decisions, write-set
+> ownership, dependency graph, and gates this task assumes.
+
 **Goal:** prove the four Windows behaviours the app depends on, on this machine, and document
 the exact code shape. Throwaway code is fine; the findings are the deliverable.
 
@@ -7,7 +10,7 @@ the exact code shape. Throwaway code is fine; the findings are the deliverable.
 **Owns:** `docs/tasks/010-findings.md`, a scratch branch/file you delete afterwards. Do not
 touch production modules.
 
-**Read first:** this index; `src/main.rs` (eframe 0.37 options), `src/app.rs` (panel structure).
+**Read first:** `src/main.rs` (eframe 0.37 options), `src/app.rs` (panel structure).
 Useful APIs: `eframe::Frame::winit_window()`, `egui::ViewportCommand::{Visible, Minimized,
 Focus, CancelClose}`, winit's `focus_window`/`set_visible`.
 

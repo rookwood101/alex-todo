@@ -1,5 +1,8 @@
 # 150 — Windows toast notifications
 
+> **Read [000-index](000-index.md) first.** It carries the decisions, write-set
+> ownership, dependency graph, and gates this task assumes.
+
 **Goal:** real Windows toasts for reminders, with a documented fallback. One `Notifier` trait so
 140 and 170 never depend on WinRT directly.
 
@@ -7,7 +10,7 @@
 **Owns:** `src/notify.rs`, `assets/rustboard.ico` (or reuse an existing icon), toast tests. Add
 `tauri-winrt-notification` to `Cargo.toml` in this PR.
 
-**Read first:** `docs/tasks/010-findings.md`; this index; `src/main.rs` (app id, exe path).
+**Read first:** `docs/tasks/010-findings.md`; `src/main.rs` (app id, exe path).
 
 ## Steps
 

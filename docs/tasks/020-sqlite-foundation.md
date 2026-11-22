@@ -1,5 +1,8 @@
 # 020 — SQLite foundation
 
+> **Read [000-index](000-index.md) first.** It carries the decisions, write-set
+> ownership, dependency graph, and gates this task assumes.
+
 **Goal:** open a WAL SQLite database at a stable path, apply versioned SQL migrations with
 checksums and backups, and expose the connection to the rest of the app. No tables or commands
 yet; those are 030/040.
@@ -8,7 +11,7 @@ yet; those are 030/040.
 **Owns:** `src/store/**`, `Cargo.toml` (database dependencies only), `src/store` module
 declaration in `src/main.rs`. Do **not** touch `src/app.rs` or delete `src/persist.rs` yet.
 
-**Read first:** this index; `src/persist.rs` (reuse its atomic-write mindset and scratch-dir test
+**Read first:** `src/persist.rs` (reuse its atomic-write mindset and scratch-dir test
 helper); `src/main.rs`.
 
 ## Steps

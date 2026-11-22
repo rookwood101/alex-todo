@@ -1,12 +1,15 @@
 # 060 — Civil time and DST
 
+> **Read [000-index](000-index.md) first.** It carries the decisions, write-set
+> ownership, dependency graph, and gates this task assumes.
+
 **Goal:** store deadlines as wall-clock time plus an IANA zone, and resolve them to instants at
 runtime with explicit, tested behaviour across GMT/BST transitions.
 
 **Depends on:** 030 (`jiff` is added by 020). **Parallel with:** 070, 080.
 **Owns:** `src/time.rs`, `src/time` module declaration. Do not edit `Cargo.toml`.
 
-**Read first:** this index (data conventions); `030`'s `*_local`/`*_tz`/`*_utc_ms` columns.
+**Read first:** `030`'s `*_local`/`*_tz`/`*_utc_ms` columns.
 
 ## Steps
 

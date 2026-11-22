@@ -1,5 +1,8 @@
 # 100 — Canvas: nesting, arrows, snooze, done
 
+> **Read [000-index](000-index.md) first.** It carries the decisions, write-set
+> ownership, dependency graph, and gates this task assumes.
+
 **Goal:** render the layout tree and make it interactive: containers, chips, arrows, snooze
 opacity, done animation, drag-to-reparent, link handles. No delete button.
 
@@ -7,7 +10,7 @@ opacity, done animation, drag-to-reparent, link handles. No delete button.
 **Owns:** `src/canvas.rs`, small additions under `src/ui/**`. Coordinate any `src/app.rs` change
 with 170.
 
-**Read first:** this index; `src/canvas.rs` (camera, painting, input); `src/layout.rs`;
+**Read first:** `src/canvas.rs` (camera, painting, input); `src/layout.rs`;
 `src/theme.rs`.
 
 ## Steps

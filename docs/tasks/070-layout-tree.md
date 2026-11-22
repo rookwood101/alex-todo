@@ -1,12 +1,15 @@
 # 070 — Recursive tiling layout
 
+> **Read [000-index](000-index.md) first.** It carries the decisions, write-set
+> ownership, dependency graph, and gates this task assumes.
+
 **Goal:** compute every note's rectangle from the board graph: group columns at the root, nested
 notes tiled inside containers, pinned root notes respected. Pure functions, no rendering.
 
 **Depends on:** 030. **Parallel with:** 040–060.
 **Owns:** `src/layout.rs`, `src/layout` module declaration. Do not edit `canvas.rs`.
 
-**Read first:** this index; the `notes.parent_id/group_id/layout_mode/pos_x/pos_y/sort_order`
+**Read first:** the `notes.parent_id/group_id/layout_mode/pos_x/pos_y/sort_order`
 columns; `src/theme.rs` for sizes.
 
 ## Steps

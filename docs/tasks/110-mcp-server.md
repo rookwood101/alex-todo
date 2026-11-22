@@ -1,5 +1,8 @@
 # 110 — MCP server and safe `board_sql`
 
+> **Read [000-index](000-index.md) first.** It carries the decisions, write-set
+> ownership, dependency graph, and gates this task assumes.
+
 **Goal:** expose the board to Pi over stdio MCP and make `board_sql` powerful but unable to
 touch history. This is the security boundary; take it seriously.
 
@@ -7,7 +10,7 @@ touch history. This is the security boundary; take it seriously.
 **Owns:** `src/mcp/**`, `src/bin/rustboard-mcp.rs`, MCP tests. Add `rmcp` to `Cargo.toml` in this
 PR; coordinate the one-line merge conflict with 120.
 
-**Read first:** this index; `src/command.rs`; `src/history.rs`; the
+**Read first:** `src/command.rs`; `src/history.rs`; the
 [rusqlite authorizer](https://docs.rs/rusqlite/latest/rusqlite/struct.Connection.html#method.authorizer)
 and [`AuthAction`](https://docs.rs/rusqlite/latest/rusqlite/hooks/enum.AuthAction.html) docs.
 

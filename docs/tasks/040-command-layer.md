@@ -1,5 +1,8 @@
 # 040 — Command layer and debug CLI
 
+> **Read [000-index](000-index.md) first.** It carries the decisions, write-set
+> ownership, dependency graph, and gates this task assumes.
+
 **Goal:** one typed mutation path shared by the UI, the CLI, and (later) MCP. Every command
 validates, executes inside one transaction, and leaves a batch + events for 050. This is the
 spine; no UI.
@@ -7,7 +10,7 @@ spine; no UI.
 **Depends on:** 030, 060 (`TimeSpec`). **Parallel with:** 050 planning, 070.
 **Owns:** `src/model.rs`, `src/command.rs`, `src/bin/todo.rs`.
 
-**Read first:** this index; `030`'s schema; `src/board.rs` (the old model, for reference only).
+**Read first:** `030`'s schema; `src/board.rs` (the old model, for reference only).
 
 ## Steps
 
