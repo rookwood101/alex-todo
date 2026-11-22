@@ -214,3 +214,69 @@ Then hand the agent that worktree plus the one task file. Tell it to read this i
 file, and the files it owns. Agents should read the existing code before editing, run the gates,
 and report the exact commands and results. Merge in dependency order; rebase on `main` before
 each merge. Remove the stale `.agents/worktrees/dsh-*` checkout once task 170 lands.
+
+---
+
+## Implementation notes (maintained by the integrator)
+
+These notes record decisions made while executing the plan. They are binding for later tasks.
+
+### Build environment on this machine
+
+- `cargo` is not on `PATH`; every build command begins with:
+
+  ```powershell
+  $env:PATH = "$env:USERPROFILE\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin;$env:PATH"
+  ```
+
+  `cargo-clippy` and `cargo-fmt` live in that same folder and are installed.
+- **%TEMP% denies file creation here.** Any C compilation (`libsqlite3-sys`) and any test that
+  writes through `std::env::temp_dir()` fails without this preamble. Point the temp variables at
+  a writable folder inside the checkout first:
+
+  ```powershell
+  $env:TMP = Join-Path (Get-Location) 'target\tmp'
+  $env:TEMP = $env:TMP
+  New-Item -ItemType Directory -Force -Path $env:TMP | Out-Null
+  ```
+
+  Symptom without it: MSVC `error D8050: cannot execute c1.dll` or `C1083 ... _CL_...`.
+- Native-command stderr becomes a PowerShell error; set `$ErrorActionPreference='Continue'` and
+  check `$LASTEXITCODE`.
+
+### Module homes (scaffolded once, so tasks never edit `src/main.rs`)
+
+`src/main.rs` declares every v2 module and each has an empty stub file:
+
+`agent/mod.rs`, `capture.rs`, `command.rs`, `config.rs`, `history.rs`, `layout.rs`,
+`mcp/mod.rs`, `model.rs`, `notify.rs`, `platform/mod.rs`, `remind.rs`, `store/schema.rs`,
+`time.rs`, `ui/mod.rs`.
+
+- Replace the stub with your implementation; **do not edit `src/main.rs`** and do not add
+  `mod` lines for existing homes. Add submodules and new bins freely.
+- Each declaration carries `#[allow(dead_code)]` until 170 wires the app; leave it alone.
+  Inside your own module, do not add `#![allow(dead_code)]`; only test-only helpers may be
+  `#[cfg(test)]`.
+- `src/bin/todo.rs` (040) and `src/bin/rustboard-mcp.rs` (110) are auto-discovered; no
+  `Cargo.toml` change is needed for them.
+
+### Task 020 interface (available now)
+
+- `store::StorePaths`: `resolve(db_override)`, `resolve_from(...)` (test seam), `from_home`,
+  `from_db`, `with_migrations`, `ensure_dirs`, `home/db/backups/logs/migrations`.
+  A `--db` override pins the whole board next to that file.
+- `store::Store`: `open(path)`, `open_read_only(path)`, `open_board(&paths, &migrations)`,
+  `migrate(&migrations, backups_dir)`, `data_version()`, `check_integrity()`,
+  `connection()/connection_mut()`, `path()`.
+- `store::Migrations`: `from_dir`, `from_sql(&[(file_name, sql)])` for `include_str!` sets,
+  `Migration::checksum()`, `MigrationReport { applied, already_applied, backup }`.
+- `store::now_utc_ms()` (epoch milliseconds) and `store::StoreError` (thiserror).
+- 030 adds to `src/store/schema.rs`:
+  `pub fn migrations() -> Migrations` (embedded `include_str!` pairs) and
+  `pub fn open_board(paths: &StorePaths) -> Result<Store, StoreError>` wrapping
+  `Store::open_board`. Callers (040/110/140/170) use that helper rather than reading files.
+- Migration runner behaviour: creates `schema_migrations` itself; verifies checksums of applied
+  rows; refuses a DB newer than the build; backs up an existing DB before applying new versions
+  (fresh DBs are not backed up); applies each migration in one `BEGIN IMMEDIATE` transaction.
+  `PRAGMA foreign_keys` cannot change inside that transaction — use `defer_foreign_keys` if a
+  migration needs FK-off semantics.

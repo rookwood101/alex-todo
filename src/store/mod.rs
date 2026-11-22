@@ -6,6 +6,7 @@
 //! crate::command (task 040).
 
 pub mod paths;
+pub mod schema;
 
 use std::fs;
 use std::path::{Path, PathBuf};
