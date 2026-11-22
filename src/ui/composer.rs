@@ -886,6 +886,27 @@ mod tests {
     }
 
     #[test]
+    fn a_dst_fold_is_called_out_on_the_due_chip() {
+        let harness = Harness::new();
+        let context = ComposerContext {
+            now_utc_ms: london_now("2026-10-24T08:00:00"),
+            tz: TZ,
+            known_groups: &harness.known_groups,
+        };
+
+        let (_, chips) = capture_preview(&context, "clock change 2026-10-25 01:30");
+        let due = chips
+            .iter()
+            .find(|chip| chip.kind == ComposerChipKind::Due)
+            .expect("due chip");
+        assert!(
+            due.label.contains("DST fold"),
+            "fold note missing from {:?}",
+            due.label
+        );
+    }
+
+    #[test]
     fn capture_preview_does_not_need_a_focused_editor() {
         let harness = Harness::new();
         let context = ComposerContext::new(harness.now_utc_ms, TZ, &[]);
