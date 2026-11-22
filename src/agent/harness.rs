@@ -579,11 +579,21 @@ mod tests {
             wait_until(|| pid_file.exists(), Duration::from_secs(10)),
             "grandchild writes its pid"
         );
-        let pid: u32 = std::fs::read_to_string(&pid_file)
-            .expect("pid file reads")
-            .trim()
-            .parse()
-            .expect("pid is a number");
+        // The grandchild is still finishing its redirect, so the file can be
+        // briefly locked or empty on Windows; retry instead of racing it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let pid = loop {
+            if let Ok(text) = std::fs::read_to_string(&pid_file)
+                && let Ok(pid) = text.trim().parse::<u32>()
+            {
+                break pid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "grandchild pid is readable"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        };
         assert!(process_alive(pid), "grandchild is initially alive");
 
         drop(harness);
