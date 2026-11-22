@@ -290,15 +290,20 @@ modules to `src/lib.rs`, not `src/main.rs`.
 
 ### Progress (updated by the integrator)
 
-Completed and merged on `main`: **005, 010, 020, 030, 040, 050, 060, 070, 080, 090, 120,
-140, 150, 160**. Part of **170** (`src/config.rs`, safe per-field fallbacks) is merged too.
-Part 1 of **110** (the guarded `board_sql` pipeline and read-only query helper in
-`src/mcp/sql.rs`) is merged; the rmcp tool surface and the `rustboard-mcp` binary remain.
+All eighteen briefs are implemented on this branch: **005, 010, 020, 030, 040, 050, 060, 070,
+080, 090, 100, 110, 120, 130, 140, 150, 160, 170**. The v1 RON path (`persist.rs`,
+`board.rs`, `canvas.rs`, the `ron` dependency) is gone; the app runs on SQLite with the
+composer, chat, reminders, tray/hotkey and toasts wired in.
 
-Still to do: **100** (canvas for the new model, needs the 170 wiring), the rest of **110**,
-**130** (chat panel, in progress), and **170** (app integration: store, load/poll, composer,
-chat, reminders, tray/hotkey/toasts, delete `persist.rs`/`board.rs`/`ron`, toolbar, README,
-build script).
+Verification on the final tree: `cargo test` (263 library + 9 CLI tests), `cargo clippy
+--all-targets -- -D warnings`, `cargo fmt --check`, `cargo build --bins` and
+`cargo build --release --bins` all pass.
+
+Remaining **manual** acceptance items (need a human at the keyboard, documented in the spike
+findings): physical `Ctrl+Space` from another app, real tray clicks/double-click, a hidden-app
+toast with the shipped binary, toast click-to-focus/an activator, and a live Pi turn through the
+app against the real DeepSeek provider. The release build is unsigned until a code-signing
+certificate is provided to `scripts/build.ps1`.
 
 Build note for parallel agents: the shared `target/shared` directory can hand cargo another
 worktree's `rustboard` test binary. Before final gates, set
