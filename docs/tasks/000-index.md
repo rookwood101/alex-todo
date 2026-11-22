@@ -287,3 +287,15 @@ modules to `src/lib.rs`, not `src/main.rs`.
   (fresh DBs are not backed up); applies each migration in one `BEGIN IMMEDIATE` transaction.
   `PRAGMA foreign_keys` cannot change inside that transaction — use `defer_foreign_keys` if a
   migration needs FK-off semantics.
+
+### Progress (updated by the integrator)
+
+Completed and merged on `main`: **005, 010, 020, 030, 040, 060, 070, 080, 140, 150, 160**.
+In flight when this note was written: 050 (history), 090 (composer), 120 (Pi bridge).
+Part 1 of 110 (the guarded `board_sql` execution pipeline in `src/mcp/sql.rs`) is merged; the
+rmcp tool surface and the `rustboard-mcp` binary remain.
+
+Build note for parallel agents: the shared `target/shared` directory can hand cargo another
+worktree's `rustboard` test binary. Before final gates, set
+`CARGO_TARGET_DIR=<repo>/target/<task-name>` and run `cargo clean -p rustboard`; verify the
+compile line names your worktree. `main` itself builds in the normal `target/` directory.
