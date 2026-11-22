@@ -127,6 +127,14 @@ impl BoardView {
         self.editing.is_some()
     }
 
+    /// Stop the inline editor without emitting a command (used by the app when
+    /// an external change forces a reload, and by tests).
+    pub fn stop_editing(&mut self) {
+        self.editing = None;
+        self.edit_buffer.clear();
+        self.focus_requested = None;
+    }
+
     pub fn editing_note(&self) -> Option<&NoteId> {
         self.editing.as_ref()
     }

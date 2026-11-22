@@ -3261,7 +3261,6 @@ dependencies = [
  "eframe",
  "jiff 1.0.2",
  "rmcp",
- "ron",
  "rusqlite",
  "serde",
  "serde_json",

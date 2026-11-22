@@ -5,9 +5,7 @@
 
 pub mod agent;
 pub mod app;
-pub mod board;
 pub mod camera;
-pub mod canvas;
 pub mod capture;
 pub mod command;
 pub mod config;
@@ -18,7 +16,6 @@ pub mod layout;
 pub mod mcp;
 pub mod model;
 pub mod notify;
-pub mod persist;
 pub mod platform;
 pub mod remind;
 pub mod store;
