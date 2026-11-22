@@ -27,7 +27,8 @@ $targetDir = if ($env:CARGO_TARGET_DIR) {
 } else {
     Join-Path $repo 'target'
 }
-$exe = Join-Path $targetDir 'release\rustboard.exe'
+$binaries = @('rustboard.exe', 'rustboard-mcp.exe', 'todo.exe')
+$exes = $binaries | ForEach-Object { Join-Path $targetDir "release\$_" }
 $certSubject = 'CN=Rustboard Development, O=Rustboard'
 $certFolder = Join-Path $env:USERPROFILE '.rustboard\signing'
 
@@ -103,12 +104,14 @@ if ($env:PATH -notlike "*$cargoDir*") {
 Write-Host "cargo:  $cargo"
 Write-Host "target: $targetDir"
 
-& $cargo build --release --manifest-path $manifest
+& $cargo build --release --bins --manifest-path $manifest
 if ($LASTEXITCODE -ne 0) {
     throw "cargo build failed with exit code $LASTEXITCODE."
 }
-if (-not (Test-Path $exe)) {
-    throw "Build finished but $exe was not produced."
+foreach ($exe in $exes) {
+    if (-not (Test-Path $exe)) {
+        throw "Build finished but $exe was not produced."
+    }
 }
 
 $cert = Get-DevCertificate
@@ -119,17 +122,19 @@ if (-not $cert) {
     $cert = New-DevCertificate
 }
 
-$result = Set-AuthenticodeSignature -FilePath $exe -Certificate $cert
-if ($result.Status -ne 'Valid') {
-    throw "Signing failed: $($result.Status) - $($result.StatusMessage)"
-}
+foreach ($exe in $exes) {
+    $result = Set-AuthenticodeSignature -FilePath $exe -Certificate $cert
+    if ($result.Status -ne 'Valid') {
+        throw "Signing failed for $exe: $($result.Status) - $($result.StatusMessage)"
+    }
 
-$verified = Get-AuthenticodeSignature $exe
-if ($verified.Status -ne 'Valid') {
-    throw "The signature did not verify: $($verified.Status) - $($verified.StatusMessage)"
-}
+    $verified = Get-AuthenticodeSignature $exe
+    if ($verified.Status -ne 'Valid') {
+        throw "The signature for $exe did not verify: $($verified.Status) - $($verified.StatusMessage)"
+    }
 
-Write-Host ''
-Write-Host "Built and signed: $exe"
-Write-Host "Publisher: $($verified.SignerCertificate.Subject)"
-Write-Host "Status:    $($verified.Status)"
+    Write-Host ''
+    Write-Host "Built and signed: $exe"
+    Write-Host "Publisher: $($verified.SignerCertificate.Subject)"
+    Write-Host "Status:    $($verified.Status)"
+}

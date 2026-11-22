@@ -7,9 +7,36 @@ description = "A dark, infinite-canvas sticky-note board built with egui"
 license = "MIT"
 
 [dependencies]
+crossbeam-channel = "0.5"
 eframe = { version = "0.37.0", features = ["persistence"] }
-ron = "0.12"
+jiff = "1.0"
+rmcp = { version = "3.11", features = ["server", "transport-io"] }
+rusqlite = { version = "0.43", features = ["bundled-full"] }
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tauri-winrt-notification = "0.8"
+thiserror = "2.0"
+tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "io-std"] }
+uuid = { version = "1.0", features = ["v4"] }
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Storage_EnhancedStorage",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [profile.dev.package."*"]
 opt-level = 1

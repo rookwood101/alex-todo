@@ -1,406 +1,685 @@
+//! The eframe application shell (task 170).
+//!
+//! The app owns the SQLite store, the read model, the canvas, the composer and
+//! chat panels, the reminder thread, the tray/hotkey handle and the notifier.
+//! One frame is:
+//!
+//! 1. drain platform events (show/hide/new note/quit) and the agent channel;
+//! 2. poll PRAGMA data_version and reload the board when another connection
+//!    commits (deferred while a note editor has unsaved keystrokes);
+//! 3. draw the toolbar, board, chat and composer;
+//! 4. apply every returned Command in one batch and reload.
+
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use eframe::egui::{
-    self, Align, Color32, Key, Layout, Modifiers, PointerButton, Rect, RichText, Sense, Ui, Vec2,
-    vec2,
+use crate::agent::{AgentEvent, AgentHarness, PiConfig, PiHarness, PiProfile, ensure_mcp_config};
+use crate::command::{Actor, Applied, Command};
+use crate::config::{Config, Profile};
+use crate::history;
+use crate::model::Board;
+use crate::notify::{Notification, Notifier, NotifyError, ToastNotifier};
+use crate::platform::{
+    Hotkey, Platform, PlatformConfig, PlatformEvent, PlatformHandle, PlatformStart,
 };
-use serde::{Deserialize, Serialize};
-
-use crate::board::{Board, NoteId};
-use crate::camera::Camera;
-use crate::canvas;
-use crate::persist::StateStore;
+use crate::remind::{ReminderEngine, ReminderNotice, ReminderSink};
+use crate::store::{Store, StorePaths, now_utc_ms, schema};
 use crate::theme;
+use crate::ui::board::{BoardContext, BoardOutput, BoardView};
+use crate::ui::chat::{self, ChatOutput, ChatState, ConnectionTurnHistory, TurnHistory};
+use crate::ui::composer::{self, ComposerContext, ComposerState};
+use crossbeam_channel::Receiver;
+use eframe::egui::{self, Align, Align2, Color32, Key, Layout, Modifiers, RichText, Ui, vec2};
 
-/// Key the previous eframe-storage implementation used, kept only for a
-/// one-time migration into the state file.
-const LEGACY_STORAGE_KEY: &str = "rustboard.state.v1";
+/// How long an in-app status banner stays visible.
+const STATUS_SECONDS: u64 = 5;
 
-/// Writes are coalesced for this long so a continuous drag or a burst of
-/// typing does not write the state file on every frame.
-const SAVE_COALESCE: Duration = Duration::from_millis(250);
-
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct PersistedState {
-    pub(crate) board: Board,
-    pub(crate) camera: Camera,
+/// A short message shown over the board.
+struct StatusMessage {
+    text: String,
+    error: bool,
+    at: Instant,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum AppAction {
-    AddNote,
-    DeleteSelected,
-    Select(Option<NoteId>),
-    MoveNote { id: NoteId, screen_delta: Vec2 },
-    FitView,
-    PanBy(Vec2),
-    ZoomAt { screen_pos: egui::Pos2, factor: f32 },
+/// Notification sink for the reminder engine.
+struct ToastSink {
+    notifier: Arc<dyn Notifier>,
 }
 
-/// What the toolbar says about saving.
-struct SaveStatus {
-    label: String,
-    color: Color32,
-    tooltip: String,
+impl ReminderSink for ToastSink {
+    fn notify(&self, notice: ReminderNotice) {
+        let mut notification = Notification::new(notice.title, notice.body).with_tag(notice.tag);
+        if notice.urgent {
+            notification = notification.urgent();
+        }
+        if let Err(error) = self.notifier.notify(notification) {
+            eprintln!("rustboard: notification failed: {error}");
+        }
+    }
 }
 
+/// Notifier used when Windows toast registration is unavailable.
+struct LogNotifier;
+
+impl Notifier for LogNotifier {
+    fn notify(&self, notification: Notification) -> Result<(), NotifyError> {
+        eprintln!("rustboard: {}: {}", notification.title, notification.body);
+        Ok(())
+    }
+
+    fn test(&self) -> Result<(), NotifyError> {
+        self.notify(Notification::new("Rustboard", "Notifications are working"))
+    }
+}
+
+/// Turn history used when the store is not open.
+struct NoTurnHistory;
+
+impl TurnHistory for NoTurnHistory {
+    fn agent_batches_between(
+        &self,
+        _from_utc_ms: i64,
+        _to_utc_ms: i64,
+    ) -> Result<Vec<String>, history::HistoryError> {
+        Ok(Vec::new())
+    }
+}
+
+/// The application.
 pub struct RustboardApp {
+    pub(crate) paths: StorePaths,
+    pub(crate) store: Option<Store>,
+    pub(crate) store_error: Option<String>,
+    pub(crate) config: Config,
+    config_warnings: Vec<String>,
     pub(crate) board: Board,
-    pub(crate) camera: Camera,
-    pub(crate) selected: Option<NoteId>,
-    pub(crate) pending_focus: Option<NoteId>,
-    pub(crate) pan_button: Option<PointerButton>,
-    pub(crate) note_drag: Option<NoteId>,
-    pub(crate) fit_pending: bool,
-    pub(crate) canvas_rect: Rect,
-    store: Option<StateStore>,
-    dirty: bool,
-    last_save_attempt: Instant,
-    last_saved: Option<Instant>,
-    save_error: Option<String>,
-    load_error: Option<String>,
-    legacy_key_present: bool,
+    board_tz: String,
+    group_names: Vec<String>,
+    pub(crate) data_version: i64,
+    last_poll: Instant,
+    last_ui: Instant,
+    pub(crate) reload_deferred: bool,
+    pub(crate) view: BoardView,
+    pub(crate) composer: ComposerState,
+    pub(crate) chat: ChatState,
+    canvas_rect: egui::Rect,
+    harness: Option<Arc<dyn AgentHarness>>,
+    agent_events: Option<Receiver<AgentEvent>>,
+    agent_profile: PiProfile,
+    platform: Option<PlatformHandle>,
+    reminders: Option<ReminderEngine>,
+    notifier: Arc<dyn Notifier>,
+    notify_error: Option<String>,
+    status: Option<StatusMessage>,
+    settings_open: bool,
+    settings_hotkey: String,
+    settings_tz: String,
+    settings_model: String,
+    settings_profile: Profile,
+    settings_reminder: u64,
+    quitting: bool,
+    pending_new_note: bool,
+    full: bool,
 }
 
 impl RustboardApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    /// Production constructor. The platform handle is started before the window
+    /// exists so a second launch can forward to the first and exit.
+    pub fn new(cc: &eframe::CreationContext<'_>, platform: Option<PlatformHandle>) -> Self {
         theme::apply(&cc.egui_ctx);
-
-        let mut app = Self::from_parts(Board::seeded(), Camera::default(), true);
-        app.store = Some(StateStore::open());
-        if let Some(error) = app.store.as_ref().and_then(StateStore::last_error) {
-            app.save_error = Some(error.to_owned());
-        }
-
-        let legacy = cc
-            .storage
-            .and_then(|storage| eframe::get_value::<PersistedState>(storage, LEGACY_STORAGE_KEY));
-        app.restore(legacy);
-
-        app
+        let paths = StorePaths::resolve(None)
+            .unwrap_or_else(|_| StorePaths::from_home(std::env::temp_dir().join("Rustboard")));
+        Self::build(paths, platform, true)
     }
 
-    fn from_parts(board: Board, camera: Camera, fit_pending: bool) -> Self {
-        Self {
-            board,
-            camera,
-            selected: None,
-            pending_focus: None,
-            pan_button: None,
-            note_drag: None,
-            fit_pending,
-            canvas_rect: Rect::ZERO,
+    fn build(paths: StorePaths, platform: Option<PlatformHandle>, full: bool) -> Self {
+        let (config, warnings) = Config::load_for(&paths);
+        let board_tz = config.zone();
+        let mut app = Self {
+            paths,
             store: None,
-            dirty: false,
-            last_save_attempt: Instant::now(),
-            last_saved: None,
-            save_error: None,
-            load_error: None,
-            legacy_key_present: false,
+            store_error: None,
+            settings_hotkey: config.hotkey.clone(),
+            settings_tz: config.tz.clone().unwrap_or_default(),
+            settings_model: config.pi_model.clone(),
+            settings_profile: config.pi_profile,
+            settings_reminder: config.reminder_minutes,
+            config_warnings: warnings,
+            config,
+            board: Board::default(),
+            board_tz,
+            group_names: Vec::new(),
+            data_version: -1,
+            last_poll: Instant::now(),
+            last_ui: Instant::now() - Duration::from_secs(60),
+            reload_deferred: false,
+            view: BoardView::new(),
+            composer: ComposerState::new(),
+            chat: ChatState::new(),
+            canvas_rect: egui::Rect::ZERO,
+            harness: None,
+            agent_events: None,
+            agent_profile: PiProfile::Board,
+            platform,
+            reminders: None,
+            notifier: Arc::new(LogNotifier),
+            notify_error: None,
+            status: None,
+            settings_open: false,
+            quitting: false,
+            pending_new_note: false,
+            full,
+        };
+        if full {
+            app.start_notifications();
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_test() -> Self {
-        Self::from_parts(Board::seeded(), Camera::default(), true)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_test_with_store(path: impl Into<std::path::PathBuf>) -> Self {
-        let mut app = Self::from_parts(Board::seeded(), Camera::default(), true);
-        app.store = Some(StateStore::at(path));
+        app.open_store();
+        if !app.config_warnings.is_empty() {
+            let warning = app.config_warnings.join("; ");
+            app.set_status(warning, true);
+        }
         app
     }
 
-    /// Load the state file, falling back to the old eframe payload.
-    fn restore(&mut self, legacy: Option<PersistedState>) {
-        let legacy_present = legacy.is_some();
+    /// Test constructor: a private board home, no platform and no OS toasts.
+    #[cfg(test)]
+    pub(crate) fn for_test(paths: StorePaths, _context: egui::Context) -> Self {
+        Self::build(paths, None, false)
+    }
 
-        let mut loaded = None;
-        if let Some(store) = &self.store {
-            match store.load::<PersistedState>() {
-                Ok(state) => loaded = state,
-                Err(error) => self.load_error = Some(error),
+    fn start_notifications(&mut self) {
+        if let Err(error) = crate::notify::ensure_app_id() {
+            self.notify_error = Some(format!("Windows app id: {error}"));
+        }
+        match ToastNotifier::new() {
+            Ok(notifier) => self.notifier = Arc::new(notifier),
+            Err(error) => {
+                self.notify_error = Some(format!("Windows toasts are unavailable: {error}"));
             }
         }
-
-        let migrated = loaded.is_none() && legacy_present;
-        if let Some(mut saved) = loaded.or(legacy) {
-            saved.board.sanitize();
-            saved.camera.sanitize();
-            self.board = saved.board;
-            self.camera = saved.camera;
-            self.fit_pending = false;
-        }
-
-        self.legacy_key_present = legacy_present;
-        if migrated {
-            // Write the old payload into the state file on the next save.
-            self.dirty = true;
-        }
     }
 
-    pub(crate) fn mark_dirty(&mut self) {
-        self.dirty = true;
-    }
-
-    /// Write the board and camera to disk now, if anything changed.
-    pub(crate) fn save_now(&mut self) {
-        if !self.dirty {
+    fn open_store(&mut self) {
+        if let Err(error) = self.paths.ensure_dirs() {
+            self.store_error = Some(format!("Cannot create the board folder: {error}"));
             return;
         }
+        match schema::open_board(&self.paths) {
+            Ok(store) => {
+                self.store = Some(store);
+                self.store_error = None;
+                self.reload_now();
+                if self.full {
+                    self.start_reminders();
+                }
+            }
+            Err(error) => {
+                self.store = None;
+                self.store_error = Some(format!("{error}"));
+            }
+        }
+    }
+
+    fn start_reminders(&mut self) {
+        self.reminders = None;
+        if self.store.is_none() {
+            return;
+        }
+        let sink: Arc<dyn ReminderSink> = Arc::new(ToastSink {
+            notifier: Arc::clone(&self.notifier),
+        });
+        let interval = Duration::from_secs(self.config.reminder_minutes.max(1) * 60);
+        match ReminderEngine::start(self.paths.clone(), sink, interval) {
+            Ok(engine) => self.reminders = Some(engine),
+            Err(error) => self.set_status(format!("Reminders are off: {error}"), true),
+        }
+    }
+
+    /// Reload the active board from the store.
+    pub(crate) fn reload_now(&mut self) {
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        match Board::load(store.connection()) {
+            Ok(board) => {
+                self.group_names = board
+                    .groups
+                    .iter()
+                    .map(|group| group.name.clone())
+                    .collect();
+                self.board = board;
+                self.view.after_reload(&self.board);
+                self.data_version = store.data_version().unwrap_or(self.data_version);
+                self.reload_deferred = false;
+            }
+            Err(error) => self.set_status(format!("Cannot read the board: {error}"), true),
+        }
+    }
+
+    /// Apply one batch and reload. Returns the batch result for callers that
+    /// need the new ids (the toolbar's New note focuses the new card).
+    pub(crate) fn apply_commands(
+        &mut self,
+        commands: Vec<Command>,
+        label: &str,
+    ) -> Option<Applied> {
+        if commands.is_empty() {
+            return None;
+        }
+        let Some(store) = self.store.as_mut() else {
+            self.set_status("The board is not open", true);
+            return None;
+        };
+        match store.apply(&commands, Actor::Human, Some(label)) {
+            Ok(applied) => {
+                self.reload_now();
+                let changed = applied
+                    .effects
+                    .iter()
+                    .map(|effect| effect.affected)
+                    .sum::<usize>();
+                self.set_status(format!("Saved {changed} change(s)"), false);
+                Some(applied)
+            }
+            Err(error) => {
+                self.set_status(format!("{error}"), true);
+                None
+            }
+        }
+    }
+
+    /// Force a data_version poll (used by tests and the hidden-window path).
+    #[cfg(test)]
+    pub(crate) fn poll_for_test(&mut self) {
+        self.poll_store(&egui::Context::default(), true);
+    }
+
+    pub(crate) fn undo(&mut self) {
         let Some(store) = self.store.as_mut() else {
             return;
         };
+        match history::undo_last(store) {
+            Ok(outcome) => {
+                self.reload_now();
+                self.set_status(format!("Undid {} change(s)", outcome.events), false);
+            }
+            Err(history::HistoryError::NothingToUndo) => {
+                self.set_status("Nothing to undo", false);
+            }
+            Err(error) => self.set_status(format!("Undo failed: {error}"), true),
+        }
+    }
 
-        self.last_save_attempt = Instant::now();
-        let state = PersistedState {
-            board: self.board.clone(),
-            camera: self.camera,
+    pub(crate) fn redo(&mut self) {
+        let Some(store) = self.store.as_mut() else {
+            return;
         };
+        match history::redo_last(store) {
+            Ok(outcome) => {
+                self.reload_now();
+                self.set_status(format!("Redid {} change(s)", outcome.events), false);
+            }
+            Err(history::HistoryError::NothingToRedo) => {
+                self.set_status("Nothing to redo", false);
+            }
+            Err(error) => self.set_status(format!("Redo failed: {error}"), true),
+        }
+    }
 
-        match store.save(&state) {
+    fn new_note(&mut self) {
+        let applied = self.apply_commands(
+            vec![Command::AddNote {
+                text: String::new(),
+                group: None,
+                parent: None,
+                due: None,
+                remind: None,
+                priority: None,
+                source: "human".to_owned(),
+            }],
+            "new note",
+        );
+        if let Some(id) = applied.and_then(|applied| applied.new_ids.notes.first().cloned()) {
+            self.view.edit_note(&self.board, id);
+        }
+    }
+
+    fn send_prompt(&mut self, prompt: String) {
+        let prompt = prompt.trim().to_owned();
+        if prompt.is_empty() {
+            return;
+        }
+        let harness = match self.ensure_harness() {
+            Ok(harness) => harness,
+            Err(error) => {
+                self.chat.error = Some(error.clone());
+                self.set_status(error, true);
+                return;
+            }
+        };
+        match harness.send(&prompt) {
             Ok(()) => {
-                self.dirty = false;
-                self.last_saved = Some(Instant::now());
-                self.save_error = None;
-                self.load_error = None;
+                self.chat.push_user_message(prompt);
+                chat::begin_turn(&mut self.chat, now_utc_ms());
             }
-            Err(error) => self.save_error = Some(error),
+            Err(error) => {
+                self.chat.error = Some(error.to_string());
+                self.set_status(format!("Pi: {error}"), true);
+            }
         }
     }
 
-    /// Save shortly after every edit, coalescing bursts into one write.
-    fn maybe_autosave(&mut self, ctx: &egui::Context) {
-        if !self.dirty || self.store.is_none() {
+    fn ensure_harness(&mut self) -> Result<Arc<dyn AgentHarness>, String> {
+        if let Some(harness) = &self.harness {
+            return Ok(Arc::clone(harness));
+        }
+        if let Err(error) = ensure_mcp_config(self.paths.home(), self.paths.db()) {
+            self.set_status(format!("MCP config: {error}"), true);
+        }
+        let mut config = PiConfig::new(self.paths.home(), self.agent_profile);
+        config.model = self.config.pi_model.clone();
+        config.provider = self.config.pi_provider.clone();
+        let harness = PiHarness::new(config);
+        self.agent_events = Some(harness.events());
+        let harness: Arc<dyn AgentHarness> = Arc::new(harness);
+        self.harness = Some(Arc::clone(&harness));
+        Ok(harness)
+    }
+
+    fn set_status(&mut self, text: impl Into<String>, error: bool) {
+        self.status = Some(StatusMessage {
+            text: text.into(),
+            error,
+            at: Instant::now(),
+        });
+    }
+
+    fn handle_platform(&mut self, ctx: &egui::Context) {
+        while let Some(event) = self.platform.as_ref().and_then(PlatformHandle::take_event) {
+            match event {
+                PlatformEvent::Show => {
+                    show_window(ctx);
+                    self.composer.request_focus();
+                }
+                PlatformEvent::NewNote => {
+                    show_window(ctx);
+                    self.pending_new_note = true;
+                }
+                PlatformEvent::Quit => {
+                    self.quitting = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                PlatformEvent::Toggle => {
+                    if ctx.input(|input| input.viewport().focused.unwrap_or(true)) {
+                        self.hide_window(ctx);
+                    } else {
+                        show_window(ctx);
+                    }
+                }
+            }
+        }
+        if self.pending_new_note {
+            self.pending_new_note = false;
+            self.new_note();
+        }
+    }
+
+    fn hide_window(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        if let Some(platform) = &self.platform
+            && let Err(error) = platform.request_hide()
+        {
+            eprintln!("rustboard: hide failed: {error}");
+        }
+    }
+
+    fn handle_close(&mut self, ctx: &egui::Context) {
+        if ctx.input(|input| input.viewport().close_requested()) && !self.quitting {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.hide_window(ctx);
+        }
+    }
+
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        if ctx.egui_wants_keyboard_input() || self.settings_open {
             return;
         }
+        let redo_modifiers = Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Modifiers::default()
+        };
+        let (undo, redo, new_note) = ctx.input_mut(|input| {
+            (
+                input.consume_key(Modifiers::CTRL, Key::Z),
+                input.consume_key(redo_modifiers, Key::Z),
+                input.consume_key(Modifiers::CTRL, Key::N),
+            )
+        });
+        if undo {
+            self.undo();
+        }
+        if redo {
+            self.redo();
+        }
+        if new_note {
+            self.new_note();
+        }
+    }
 
-        let waited = self.last_save_attempt.elapsed();
-        if self.last_saved.is_none() || waited >= SAVE_COALESCE {
-            self.save_now();
-            if self.dirty {
-                // The write failed: keep the indicator visible without spinning.
-                ctx.request_repaint_after(Duration::from_secs(1));
-            }
+    fn poll_store(&mut self, ctx: &egui::Context, force: bool) {
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        let interval = if self.last_ui.elapsed() < Duration::from_millis(500) {
+            Duration::from_millis(100)
         } else {
-            ctx.request_repaint_after(SAVE_COALESCE - waited);
+            Duration::from_secs(1)
+        };
+        if !force {
+            let elapsed = self.last_poll.elapsed();
+            if elapsed < interval {
+                ctx.request_repaint_after(interval - elapsed);
+                return;
+            }
+        }
+        self.last_poll = Instant::now();
+        match store.data_version() {
+            Ok(version) if version != self.data_version => {
+                if self.view.is_editing() {
+                    self.reload_deferred = true;
+                    ctx.request_repaint_after(interval);
+                } else {
+                    self.reload_now();
+                }
+            }
+            Ok(_) => {}
+            Err(error) => self.set_status(format!("Cannot poll the board: {error}"), true),
         }
     }
 
-    fn save_status(&self) -> SaveStatus {
-        let location = self
-            .store
-            .as_ref()
-            .map(|store| store.path().display().to_string())
-            .unwrap_or_else(|| "no state file".to_owned());
-
-        if let Some(error) = &self.save_error {
-            return SaveStatus {
-                label: "Save failed".to_owned(),
-                color: theme::SAVE_ERROR,
-                tooltip: format!("{error}\n\nClick to retry saving.\nTarget: {location}"),
-            };
-        }
-        if let Some(error) = &self.load_error {
-            return SaveStatus {
-                label: "Save unreadable".to_owned(),
-                color: theme::SAVE_WARN,
-                tooltip: format!(
-                    "{error}\n\nThe sample board was opened instead; new edits are written to {location}."
-                ),
-            };
-        }
-        if self.store.is_none() {
-            return SaveStatus {
-                label: "Saving off".to_owned(),
-                color: theme::TEXT_MUTED,
-                tooltip: "This session has no state file.".to_owned(),
-            };
-        }
-        if self.dirty {
-            return SaveStatus {
-                label: "Saving…".to_owned(),
-                color: theme::TEXT_MUTED,
-                tooltip: format!("Writing {location}"),
-            };
-        }
-        if self.last_saved.is_some() {
-            return SaveStatus {
-                label: "Saved".to_owned(),
-                color: theme::SAVE_OK,
-                tooltip: format!(
-                    "Every edit is saved automatically.\n{location}\n\nClick to save now (Ctrl+S)."
-                ),
-            };
-        }
-
-        SaveStatus {
-            label: "Auto-save on".to_owned(),
-            color: theme::TEXT_MUTED,
-            tooltip: format!("Edits are saved automatically to {location}."),
-        }
-    }
-
-    pub(crate) fn update(&mut self, action: AppAction) {
-        match action {
-            AppAction::AddNote => {
-                let cascade_index = (self.board.notes.len() % 6) as f32;
-                let zoom = self.camera.zoom.max(0.01);
-                let cascade = [cascade_index * 24.0 / zoom, cascade_index * 18.0 / zoom];
-                let center = [self.camera.center[0], self.camera.center[1]];
-                let id = self.board.add_note(center, cascade);
-                self.selected = Some(id);
-                self.pending_focus = Some(id);
-                self.mark_dirty();
-            }
-            AppAction::DeleteSelected => {
-                if let Some(id) = self.selected.take() {
-                    if self.board.remove(id) {
-                        self.mark_dirty();
-                    }
-                    if self.pending_focus == Some(id) {
-                        self.pending_focus = None;
-                    }
-                }
-            }
-            AppAction::Select(id) => {
-                self.selected = id;
-                if let Some(id) = id {
-                    let before = self.board.notes.iter().position(|note| note.id == id);
-                    self.board.bring_to_front(id);
-                    let after = self.board.notes.iter().position(|note| note.id == id);
-                    if before != after {
-                        self.mark_dirty();
-                    }
-                }
-            }
-            AppAction::MoveNote { id, screen_delta } => {
-                if screen_delta == Vec2::ZERO {
-                    return;
-                }
-                let zoom = self.camera.zoom.max(0.01);
-                if let Some(note) = self.board.notes.iter_mut().find(|note| note.id == id) {
-                    note.pos[0] += screen_delta.x / zoom;
-                    note.pos[1] += screen_delta.y / zoom;
-                    self.mark_dirty();
-                }
-            }
-            AppAction::FitView => {
-                self.fit_pending = true;
-            }
-            AppAction::PanBy(delta) => {
-                if delta == Vec2::ZERO {
-                    return;
-                }
-                self.camera.pan_screen(delta);
-                self.mark_dirty();
-            }
-            AppAction::ZoomAt { screen_pos, factor } => {
-                let before = self.camera;
-                self.camera.zoom_at(screen_pos, self.canvas_rect, factor);
-                if self.camera != before {
-                    self.mark_dirty();
-                }
-            }
-        }
-    }
-
-    fn shortcuts(&mut self, ctx: &egui::Context) {
-        // Saving must work even while a note editor has keyboard focus.
-        let mut save = false;
-        ctx.input_mut(|input| {
-            save = input.consume_key(Modifiers::CTRL, Key::S);
-        });
-        if save {
-            self.save_now();
-        }
-
-        if ctx.egui_wants_keyboard_input() {
+    fn pump_agent(&mut self) {
+        let Some(events) = self.agent_events.as_ref() else {
             return;
+        };
+        let Some(store) = self.store.as_ref() else {
+            chat::pump_events(&mut self.chat, events);
+            return;
+        };
+        let history = ConnectionTurnHistory::new(store.connection());
+        chat::pump_events_and_end_turn(&mut self.chat, events, &history);
+    }
+
+    pub(crate) fn show_ui(&mut self, ui: &mut Ui) {
+        let ctx = ui.ctx().clone();
+        self.last_ui = Instant::now();
+        let composer_focused = self.composer.has_focus(&ctx);
+        self.handle_shortcuts(&ctx);
+
+        egui::Panel::top("toolbar")
+            .exact_size(56.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::TOOLBAR_BG)
+                    .inner_margin(egui::Margin::symmetric(14, 10)),
+            )
+            .show(ui, |ui| self.toolbar(ui));
+
+        let output = self.canvas(ui);
+        self.canvas_rect = output.canvas_rect;
+        self.apply_board_output(output);
+
+        let chat_output = self.show_chat(&ctx);
+        self.handle_chat_output(chat_output);
+
+        self.composer.set_busy(self.chat.busy);
+        let composer_context =
+            ComposerContext::new(now_utc_ms(), &self.board_tz, &self.group_names);
+        let composer_output =
+            composer::show(&mut self.composer, &ctx, self.chat.busy, &composer_context);
+        if let Some(command) = composer_output.capture {
+            self.apply_commands(vec![command], "capture");
+        }
+        if let Some(prompt) = composer_output.agent_prompt {
+            self.send_prompt(prompt);
         }
 
-        let mut add_note = false;
-        let mut delete_note = false;
-        ctx.input_mut(|input| {
-            add_note = input.consume_key(Modifiers::CTRL, Key::N);
-            delete_note = input.consume_key(Modifiers::NONE, Key::Delete)
-                || input.consume_key(Modifiers::NONE, Key::Backspace);
-        });
+        self.show_settings(&ctx);
+        self.show_status(&ctx);
 
-        if add_note {
-            self.update(AppAction::AddNote);
+        if ctx.input(|input| input.key_pressed(Key::Escape))
+            && !composer_focused
+            && !ctx.egui_wants_keyboard_input()
+            && !self.settings_open
+        {
+            self.hide_window(&ctx);
         }
-        if delete_note {
-            self.update(AppAction::DeleteSelected);
+
+        if self.reload_deferred && !self.view.is_editing() {
+            self.reload_now();
+        }
+    }
+
+    fn canvas(&mut self, ui: &mut Ui) -> BoardOutput {
+        let now = now_utc_ms();
+        let context = BoardContext {
+            board: &self.board,
+            now_utc_ms: now,
+            tz: &self.board_tz,
+        };
+        egui::CentralPanel::no_frame()
+            .show(ui, |ui| self.view.show(ui, &context))
+            .inner
+    }
+
+    fn apply_board_output(&mut self, output: BoardOutput) {
+        if !output.commands.is_empty() {
+            self.apply_commands(output.commands, "canvas");
+        }
+    }
+
+    fn show_chat(&mut self, ctx: &egui::Context) -> ChatOutput {
+        match self.store.as_ref() {
+            Some(store) => {
+                let history = ConnectionTurnHistory::new(store.connection());
+                chat::show(&mut self.chat, ctx, &history)
+            }
+            None => chat::show(&mut self.chat, ctx, &NoTurnHistory),
+        }
+    }
+
+    fn handle_chat_output(&mut self, output: ChatOutput) {
+        if output.stop_requested
+            && let Some(harness) = &self.harness
+            && let Err(error) = harness.abort()
+        {
+            self.set_status(format!("Stop failed: {error}"), true);
+        }
+        if let Some(ids) = output.undo_turn_requested {
+            self.undo_turn(&ids);
+        }
+        if output.mode_toggled {
+            self.agent_profile = self.chat.mode.profile();
+            if let Some(harness) = &self.harness
+                && let Err(error) = harness.start(self.agent_profile)
+            {
+                self.set_status(format!("Cannot switch profile: {error}"), true);
+            }
+        }
+    }
+
+    fn undo_turn(&mut self, ids: &[String]) {
+        let Some(store) = self.store.as_mut() else {
+            return;
+        };
+        match history::undo_batches(store, ids) {
+            Ok(outcome) => {
+                self.reload_now();
+                self.set_status(
+                    format!("Undid the agent turn ({} change(s))", outcome.events),
+                    false,
+                );
+            }
+            Err(error) => self.set_status(format!("Undo turn failed: {error}"), true),
         }
     }
 
     fn toolbar(&mut self, ui: &mut Ui) {
         ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-            let (icon_rect, _) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::hover());
-            ui.painter().rect_filled(icon_rect, 7, theme::ACCENT);
-            let mark = Rect::from_center_size(icon_rect.center(), vec2(8.0, 11.0));
-            ui.painter()
-                .rect_filled(mark, 2, Color32::from_rgb(0x10, 0x17, 0x29));
-
-            ui.add_space(8.0);
             ui.label(
                 RichText::new("Rustboard")
                     .size(20.0)
                     .strong()
                     .color(theme::TEXT_PRIMARY),
             );
-            ui.add_space(14.0);
-
-            let new_note = egui::Button::new(
-                RichText::new("+  New note")
-                    .strong()
-                    .color(Color32::from_rgb(0x0e, 0x14, 0x24)),
-            )
-            .fill(theme::ACCENT)
-            .corner_radius(8)
-            .min_size(vec2(118.0, 32.0));
-
+            ui.add_space(12.0);
             if ui
-                .add(new_note)
-                .on_hover_text("Add a note at the center of the view (Ctrl+N)")
+                .add(
+                    egui::Button::new(
+                        RichText::new("+  New note")
+                            .strong()
+                            .color(Color32::from_rgb(0x0e, 0x14, 0x24)),
+                    )
+                    .fill(theme::ACCENT)
+                    .corner_radius(8)
+                    .min_size(vec2(112.0, 30.0)),
+                )
+                .on_hover_text("Add a note in the Inbox (Ctrl+N)")
                 .clicked()
             {
-                self.update(AppAction::AddNote);
+                self.new_note();
             }
-
-            let delete = egui::Button::new("Delete")
-                .corner_radius(8)
-                .min_size(vec2(76.0, 32.0));
-            if ui
-                .add_enabled(self.selected.is_some(), delete)
-                .on_disabled_hover_text("Select a note first")
-                .on_hover_text("Delete the selected note")
-                .clicked()
-            {
-                self.update(AppAction::DeleteSelected);
+            if ui.button("Undo").on_hover_text("Undo (Ctrl+Z)").clicked() {
+                self.undo();
             }
-
-            let fit = egui::Button::new("Fit view")
-                .corner_radius(8)
-                .min_size(vec2(82.0, 32.0));
             if ui
-                .add(fit)
-                .on_hover_text("Frame every note on the board")
+                .button("Redo")
+                .on_hover_text("Redo (Ctrl+Shift+Z)")
                 .clicked()
             {
-                self.update(AppAction::FitView);
+                self.redo();
+            }
+            if ui.button("Fit view").clicked() {
+                self.view.fit_next_frame();
+            }
+            if ui
+                .button("Board folder")
+                .on_hover_text(self.paths.home().display().to_string())
+                .clicked()
+            {
+                self.open_board_folder();
+            }
+            if ui.button("Settings").clicked() {
+                self.settings_open = !self.settings_open;
             }
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.label(
-                    RichText::new(format!("{:.0}%", self.camera.zoom * 100.0))
+                    RichText::new(format!("{:.0}%", self.view.camera().zoom * 100.0))
                         .monospace()
                         .color(theme::TEXT_MUTED),
-                )
-                .on_hover_text("Zoom level — scroll over the canvas to change it");
-                ui.add_space(14.0);
+                );
+                ui.add_space(10.0);
                 ui.label(
                     RichText::new(format!(
                         "{} note{}",
@@ -410,61 +689,241 @@ impl RustboardApp {
                     .size(12.0)
                     .color(theme::TEXT_MUTED),
                 );
-                ui.add_space(14.0);
-
-                let status = self.save_status();
-                let response = ui.add(
-                    egui::Label::new(RichText::new(&status.label).size(12.0).color(status.color))
-                        .sense(Sense::click()),
-                );
-                if response.on_hover_text(status.tooltip).clicked() {
-                    self.save_now();
-                }
+                ui.add_space(10.0);
+                let profile = self.agent_profile_label();
+                ui.label(RichText::new(profile).size(12.0).color(theme::TEXT_MUTED))
+                    .on_hover_text("Pi tool profile for the chat panel");
             });
         });
     }
 
-    fn hint_bar(&mut self, ui: &mut Ui) {
-        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-            for (index, hint) in [
-                "Scroll to zoom",
-                "Right / middle drag to pan",
-                "Drag a note header to move",
-                "Click note text to edit",
-                "Del removes selected",
-                "Ctrl+S saves now",
-            ]
-            .iter()
-            .enumerate()
-            {
-                if index > 0 {
-                    ui.label(RichText::new("·").color(theme::TEXT_MUTED).size(12.0));
+    fn agent_profile_label(&self) -> &'static str {
+        match self.agent_profile {
+            PiProfile::Board => "board mode",
+            PiProfile::Power => "power mode",
+        }
+    }
+
+    fn open_board_folder(&mut self) {
+        if let Err(error) = self.paths.ensure_dirs() {
+            self.set_status(format!("Cannot open the folder: {error}"), true);
+            return;
+        }
+        let result = std::process::Command::new("explorer")
+            .arg(self.paths.home())
+            .spawn();
+        if let Err(error) = result {
+            self.set_status(format!("Cannot open the folder: {error}"), true);
+        }
+    }
+
+    fn show_settings(&mut self, ctx: &egui::Context) {
+        if !self.settings_open {
+            return;
+        }
+        let mut open = self.settings_open;
+        egui::Window::new("Settings")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                egui::Grid::new("settings_grid")
+                    .num_columns(2)
+                    .spacing([12.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label("Hotkey");
+                        ui.text_edit_singleline(&mut self.settings_hotkey);
+                        ui.end_row();
+
+                        ui.label("Board zone");
+                        ui.text_edit_singleline(&mut self.settings_tz);
+                        ui.end_row();
+
+                        ui.label("Pi model");
+                        ui.text_edit_singleline(&mut self.settings_model);
+                        ui.end_row();
+
+                        ui.label("Pi profile");
+                        egui::ComboBox::from_id_salt("pi_profile")
+                            .selected_text(self.settings_profile.as_str())
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.settings_profile,
+                                    Profile::Board,
+                                    "board",
+                                );
+                                ui.selectable_value(
+                                    &mut self.settings_profile,
+                                    Profile::Power,
+                                    "power",
+                                );
+                            });
+                        ui.end_row();
+
+                        ui.label("Reminder minutes");
+                        ui.add(egui::DragValue::new(&mut self.settings_reminder).range(1..=1440));
+                        ui.end_row();
+                    });
+                ui.separator();
+                ui.label(
+                    RichText::new(format!("Board: {}", self.paths.db().display()))
+                        .size(11.0)
+                        .color(theme::TEXT_MUTED),
+                );
+                if let Some(error) = &self.notify_error {
+                    ui.label(RichText::new(error).size(11.0).color(theme::SAVE_WARN));
                 }
-                ui.label(RichText::new(*hint).size(12.0).color(theme::TEXT_MUTED));
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        self.save_settings();
+                    }
+                    if ui.button("Test notification").clicked() {
+                        match self.notifier.test() {
+                            Ok(()) => self.set_status("Test notification sent", false),
+                            Err(error) => {
+                                self.set_status(format!("Notification failed: {error}"), true)
+                            }
+                        }
+                    }
+                    if ui.button("Undo history").clicked() {
+                        self.undo();
+                    }
+                });
+            });
+        self.settings_open = open;
+    }
+
+    fn save_settings(&mut self) {
+        let hotkey = match Hotkey::parse(&self.settings_hotkey) {
+            Ok(hotkey) => hotkey,
+            Err(error) => {
+                self.set_status(format!("Invalid hotkey: {error}"), true);
+                return;
             }
-        });
+        };
+        if !self.settings_tz.trim().is_empty()
+            && let Err(error) = crate::time::validate_zone(self.settings_tz.trim())
+        {
+            self.set_status(format!("Invalid zone: {error}"), true);
+            return;
+        }
+        let hotkey_changed = hotkey.to_string() != self.config.hotkey;
+        self.config.hotkey = hotkey.to_string();
+        self.config.tz =
+            (!self.settings_tz.trim().is_empty()).then(|| self.settings_tz.trim().to_owned());
+        self.board_tz = self.config.zone();
+        self.config.pi_model = self.settings_model.trim().to_owned();
+        self.config.pi_profile = self.settings_profile;
+        self.config.reminder_minutes = self.settings_reminder.clamp(1, 1440);
+        match self.config.save(Config::path_for(&self.paths)) {
+            Ok(()) => {
+                let note = if hotkey_changed {
+                    "Saved; restart to apply the new hotkey"
+                } else {
+                    "Settings saved"
+                };
+                self.set_status(note, false);
+                if self.full {
+                    self.start_reminders();
+                }
+            }
+            Err(error) => self.set_status(format!("Cannot save settings: {error}"), true),
+        }
+    }
+
+    fn show_status(&mut self, ctx: &egui::Context) {
+        let Some(status) = &self.status else {
+            return;
+        };
+        if status.at.elapsed() > Duration::from_secs(STATUS_SECONDS) {
+            self.status = None;
+            return;
+        }
+        egui::Area::new(egui::Id::unique("status_banner"))
+            .anchor(Align2::RIGHT_TOP, vec2(-12.0, 66.0))
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(theme::TOOLBAR_BG)
+                    .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                    .corner_radius(8)
+                    .inner_margin(egui::Margin::symmetric(10, 6))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(&status.text)
+                                .size(12.0)
+                                .color(if status.error {
+                                    theme::SAVE_ERROR
+                                } else {
+                                    theme::SAVE_OK
+                                }),
+                        );
+                    });
+            });
+        ctx.request_repaint_after(Duration::from_millis(250));
+    }
+
+    fn error_screen(&mut self, ui: &mut Ui) {
+        egui::CentralPanel::no_frame()
+            .frame(egui::Frame::new().fill(theme::CANVAS_BG))
+            .show(ui, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(120.0);
+                    ui.heading("The board could not open");
+                    ui.add_space(8.0);
+                    if let Some(error) = &self.store_error {
+                        ui.label(RichText::new(error).color(theme::SAVE_ERROR));
+                    }
+                    ui.label(
+                        RichText::new(format!("Database: {}", self.paths.db().display()))
+                            .size(12.0)
+                            .color(theme::TEXT_MUTED),
+                    );
+                    ui.add_space(12.0);
+                    if ui.button("Retry").clicked() {
+                        self.open_store();
+                    }
+                });
+            });
     }
 }
 
 impl eframe::App for RustboardApp {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.handle_platform(ctx);
+        self.handle_close(ctx);
+        self.pump_agent();
+        self.poll_store(ctx, false);
+        self.composer.set_busy(self.chat.busy);
+        if self.store.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+    }
+
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        self.handle_close(ui.ctx());
+        if self.store.is_none() {
+            self.error_screen(ui);
+            return;
+        }
         self.show_ui(ui);
     }
 
-    fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        if self.legacy_key_present {
-            storage.remove_string(LEGACY_STORAGE_KEY);
-            self.legacy_key_present = false;
-        }
-        self.save_now();
-    }
-
-    fn auto_save_interval(&self) -> Duration {
-        Duration::from_secs(2)
-    }
+    fn save(&mut self, _storage: &mut dyn eframe::Storage) {}
 
     fn on_exit(&mut self) {
-        self.save_now();
+        if let Some(reminders) = &mut self.reminders {
+            reminders.stop();
+        }
+        if let Some(harness) = &self.harness
+            && let Err(error) = harness.stop()
+        {
+            eprintln!("rustboard: stopping Pi failed: {error}");
+        }
+        if let Some(platform) = &mut self.platform
+            && let Err(error) = platform.stop()
+        {
+            eprintln!("rustboard: stopping the platform failed: {error}");
+        }
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -472,175 +931,33 @@ impl eframe::App for RustboardApp {
     }
 }
 
-impl RustboardApp {
-    pub(crate) fn show_ui(&mut self, ui: &mut Ui) {
-        self.shortcuts(ui.ctx());
+fn show_window(ctx: &egui::Context) {
+    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+}
 
-        egui::Panel::top("toolbar")
-            .exact_size(58.0)
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::TOOLBAR_BG)
-                    .inner_margin(egui::Margin::symmetric(14, 10)),
-            )
-            .show(ui, |ui| self.toolbar(ui));
-
-        egui::Panel::bottom("hint_bar")
-            .exact_size(30.0)
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::HINT_BG)
-                    .inner_margin(egui::Margin::symmetric(14, 6)),
-            )
-            .show(ui, |ui| self.hint_bar(ui));
-
-        egui::CentralPanel::no_frame().show(ui, |ui| canvas::show(self, ui));
-
-        self.maybe_autosave(ui.ctx());
+/// Platform configuration derived from the saved config.
+pub fn platform_config() -> PlatformConfig {
+    let paths = StorePaths::resolve(None).ok();
+    let hotkey = paths
+        .as_ref()
+        .and_then(|paths| Hotkey::parse(&Config::load_for(paths).0.hotkey).ok())
+        .unwrap_or_default();
+    PlatformConfig {
+        hotkey,
+        ..PlatformConfig::default()
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use eframe::Storage as _;
-
-    use super::*;
-
-    fn temp_state_path(name: &str) -> std::path::PathBuf {
-        crate::persist::scratch_dir(name).join("board.ron")
-    }
-
-    #[test]
-    fn board_and_camera_round_trip_through_the_state_file() {
-        let path = temp_state_path("round-trip");
-        let mut app = RustboardApp::for_test_with_store(&path);
-        app.board.add_note([40.0, -20.0], [24.0, 18.0]);
-        app.camera.zoom = 1.6;
-        app.camera.center = [120.0, -45.0];
-        app.mark_dirty();
-        app.save_now();
-        assert!(!app.dirty, "a successful save clears the pending flag");
-
-        let expected_board = app.board.clone();
-        let expected_camera = app.camera;
-        let saved: PersistedState = StateStore::at(&path)
-            .load()
-            .expect("state file loads")
-            .expect("state file exists");
-        assert_eq!(saved.board, expected_board);
-        assert_eq!(saved.camera, expected_camera);
-    }
-
-    #[test]
-    fn legacy_eframe_payload_is_restored_and_queued_for_saving() {
-        let path = temp_state_path("legacy");
-        let mut app = RustboardApp::for_test_with_store(&path);
-
-        let mut legacy = PersistedState {
-            board: Board::seeded(),
-            camera: Camera {
-                center: [10.0, 20.0],
-                zoom: 1.25,
-            },
-        };
-        legacy.board.add_note([5.0, 5.0], [0.0, 0.0]);
-
-        app.restore(Some(legacy));
-        assert_eq!(app.camera.center, [10.0, 20.0]);
-        assert!(app.dirty, "migrated state must be written to the new file");
-        assert!(
-            app.legacy_key_present,
-            "the old storage key should be purged"
-        );
-
-        app.save_now();
-        let saved: PersistedState = StateStore::at(&path)
-            .load()
-            .expect("state file loads")
-            .expect("state file exists");
-        assert_eq!(saved.camera.zoom, 1.25);
-        assert_eq!(saved.board.notes.len(), Board::seeded().notes.len() + 1);
-    }
-
-    #[test]
-    fn edits_mark_the_board_dirty() {
-        let mut app = RustboardApp::for_test();
-        assert!(!app.dirty);
-
-        app.update(AppAction::AddNote);
-        assert!(app.dirty);
-
-        app.dirty = false;
-        let id = app.board.notes.last().expect("note").id;
-        app.update(AppAction::Select(Some(id)));
-        assert!(!app.dirty, "selecting the front note changes nothing");
-
-        app.dirty = false;
-        app.update(AppAction::MoveNote {
-            id,
-            screen_delta: Vec2::ZERO,
-        });
-        assert!(!app.dirty, "a zero-length move changes nothing");
-
-        app.update(AppAction::MoveNote {
-            id,
-            screen_delta: vec2(4.0, 4.0),
-        });
-        assert!(app.dirty);
-    }
-
-    #[test]
-    fn failed_saves_keep_the_board_pending_and_report_the_error() {
-        let dir = crate::persist::scratch_dir("blocked");
-
-        // A file where the parent folder should be makes the target unusable.
-        let blocker = dir.join("blocked");
-        std::fs::write(&blocker, b"not a folder").expect("blocker file");
-
-        let mut app = RustboardApp::for_test_with_store(blocker.join("board.ron"));
-        app.update(AppAction::AddNote);
-        app.save_now();
-
-        assert!(app.dirty, "a failed save must stay pending");
-        assert!(app.save_error.is_some(), "the failure should be reported");
-    }
-
-    #[derive(Default)]
-    struct MemoryStorage {
-        values: std::collections::HashMap<String, String>,
-    }
-
-    impl eframe::Storage for MemoryStorage {
-        fn get_string(&self, key: &str) -> Option<String> {
-            self.values.get(key).cloned()
+/// Start the tray/hotkey thread (called by main before the window exists).
+pub fn start_platform(repaint: impl Fn() + Send + 'static) -> (Option<PlatformHandle>, bool) {
+    match Platform::start(platform_config(), repaint) {
+        Ok(PlatformStart::Started(handle)) => (Some(handle), false),
+        Ok(PlatformStart::ForwardedToExisting) => (None, true),
+        Err(error) => {
+            eprintln!("rustboard: platform integration off: {error}");
+            (None, false)
         }
-
-        fn set_string(&mut self, key: &str, value: String) {
-            self.values.insert(key.to_owned(), value);
-        }
-
-        fn remove_string(&mut self, key: &str) {
-            self.values.remove(key);
-        }
-
-        fn flush(&mut self) {}
-    }
-
-    #[test]
-    fn saving_writes_the_file_and_purges_the_legacy_key() {
-        let path = temp_state_path("legacy-purge");
-        let mut app = RustboardApp::for_test_with_store(&path);
-        app.restore(Some(PersistedState {
-            board: Board::seeded(),
-            camera: Camera::default(),
-        }));
-
-        let mut storage = MemoryStorage::default();
-        storage.set_string(LEGACY_STORAGE_KEY, "old payload".to_owned());
-        eframe::App::save(&mut app, &mut storage);
-
-        assert_eq!(storage.get_string(LEGACY_STORAGE_KEY), None);
-        assert!(path.is_file(), "the state file should exist");
-        assert!(!app.dirty);
     }
 }
