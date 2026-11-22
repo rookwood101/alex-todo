@@ -244,6 +244,13 @@ These notes record decisions made while executing the plan. They are binding for
 - Native-command stderr becomes a PowerShell error; set `$ErrorActionPreference='Continue'` and
   check `$LASTEXITCODE`.
 
+### Crate layout (scaffolded once)
+
+`src/lib.rs` exposes every module publicly and `src/main.rs` is a thin shell that calls
+`rustboard::app::RustboardApp`. The three binaries therefore share one command layer:
+`todo` and `rustboard-mcp` use `rustboard::command`, `rustboard::model`, etc. Add new
+modules to `src/lib.rs`, not `src/main.rs`.
+
 ### Module homes (scaffolded once, so tasks never edit `src/main.rs`)
 
 `src/main.rs` declares every v2 module and each has an empty stub file:
