@@ -3,8 +3,9 @@ use eframe::egui::{
     RawInput, Rect, TouchPhase, Vec2, pos2, vec2,
 };
 
-use crate::app::RustboardApp;
+use crate::app::{PersistedState, RustboardApp};
 use crate::board::NoteId;
+use crate::persist::StateStore;
 use crate::theme;
 
 const FRAME_SECONDS: f64 = 1.0 / 60.0;
@@ -18,18 +19,26 @@ struct Headless {
 
 impl Headless {
     fn new() -> Self {
+        Self::with_app(RustboardApp::for_test())
+    }
+
+    fn with_app(app: RustboardApp) -> Self {
         let ctx = Context::default();
         theme::apply(&ctx);
         let screen = Rect::from_min_size(Pos2::ZERO, vec2(1280.0, 800.0));
         let mut harness = Self {
             ctx,
-            app: RustboardApp::for_test(),
+            app,
             screen,
             time: 0.0,
         };
         harness.run_frame(Vec::new());
         harness.run_frame(Vec::new());
         harness
+    }
+
+    fn with_store(path: impl Into<std::path::PathBuf>) -> Self {
+        Self::with_app(RustboardApp::for_test_with_store(path))
     }
 
     fn run_frame(&mut self, events: Vec<Event>) {
@@ -293,4 +302,43 @@ fn ctrl_n_adds_a_note_when_not_editing() {
 
     assert_eq!(harness.app.board.notes.len(), before + 1);
     assert!(harness.app.selected.is_some());
+}
+
+#[test]
+fn typing_in_a_note_is_written_to_the_state_file() {
+    let path = crate::persist::scratch_dir("headless-save").join("board.ron");
+
+    let mut harness = Headless::with_store(&path);
+    harness.app.board.bring_to_front(2);
+    harness.run_frame(Vec::new());
+
+    let text_pos = harness.note_text_center(2);
+    harness.pointer_move(text_pos);
+    harness.pointer_button(text_pos, PointerButton::Primary, true);
+    harness.pointer_button(text_pos, PointerButton::Primary, false);
+    harness.run_frame(Vec::new());
+    harness.run_frame(Vec::new());
+
+    harness.run_frame(vec![Event::Text("Q".to_owned())]);
+    // Writes are coalesced for a short window, so let the scheduled save run.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    harness.run_frame(Vec::new());
+
+    assert!(path.is_file(), "typing should create {}", path.display());
+
+    let saved: PersistedState = StateStore::at(&path)
+        .load()
+        .expect("saved state loads")
+        .expect("saved state exists");
+    let note = saved
+        .board
+        .notes
+        .iter()
+        .find(|note| note.id == 2)
+        .expect("saved note 2");
+    assert!(
+        note.text.contains('Q'),
+        "typed text should be on disk, got {:?}",
+        note.text
+    );
 }
