@@ -7,6 +7,8 @@ mod canvas;
 #[cfg(test)]
 mod headless_tests;
 mod persist;
+#[allow(dead_code)] // wired into the app by tasks 040/170
+mod store;
 mod theme;
 
 use eframe::egui;
