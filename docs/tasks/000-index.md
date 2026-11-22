@@ -5,6 +5,64 @@ persistence into an AI todo board on SQLite, driven by Pi. Each task file is a *
 for one agent: goal, dependencies, files it owns, steps, acceptance, and out-of-scope. Spawn one
 agent per file, in the order below, and never let two agents edit the same file set at once.
 
+## Vision
+
+Rustboard is a personal todo system that **feels like a Miro board** but behaves like an
+intelligent inbox. The loop is **capture → classify/place → do → reflect**:
+
+- **Capture is instant.** One line in, a sticky note out; no model round-trip on the fast path.
+- **The board organizes itself.** Groups, an Inbox, nested containers and arrows carry meaning;
+  layout is derived, so an agent can rearrange the board without fighting human drags.
+- **The agent lives in the app.** A bottom-centre composer/chat backed by Pi can create, edit,
+  link, complete and schedule notes through MCP tools; the UI reloads within ~100 ms.
+- **The app is always available.** Global hotkey, tray, real toasts, snooze/due/done, and an
+  append-only history that can be undone indefinitely.
+- **Data is local-first and transparent.** SQLite in the user's profile, soft deletes,
+  append-only events, exportable.
+- **Later, not this version:** task detection from email and calendar-aware "good time"
+  suggestions. The board works without them.
+
+The canvas is the reflect/plan surface; the composer and reminders are the do surface. This is
+not a Miro clone: no connectors, templates or multiplayer.
+
+## The steer
+
+Decisions made during the design review; these override earlier proposals.
+
+- **Harness:** Pi 1.6.0 over Claude Code or DSH — install it now and get embedding right.
+- **Storage:** SQLite, not a file. Powerful SQL is a feature; concurrency is SQLite's job.
+- **History:** everything soft-deleted, infinite undo, append-only batch/event log.
+- **Board shape:** notes tile recursively inside each other; arrows link notes; Inbox is the
+  default landing area.
+- **Capture:** plain text + Enter creates a note; **Tab** toggles Capture ↔ Agent; no Ctrl+Enter
+  and no `?` prefix.
+- **Time:** store civil wall time + IANA zone and resolve at runtime; no v1 data migration.
+- **Appearance:** due dates and reminders never change opacity; only explicit snooze dims.
+- **Windows:** tray icon, Esc/X hide, two-key hotkey, real Windows toasts.
+- **Agent scope:** board mode gets board tools only; power mode adds OS tools. `board_sql` is
+  allowed by default, but the agent must not touch undo history.
+- **Delivery:** one-page Markdown briefs so agents can be spawned per task.
+
+## Paths not taken (briefly)
+
+- **Single JSON/RON file + file watcher.** Replaced by SQLite and `PRAGMA data_version` polling;
+  WAL file events are noisy and miss commits.
+- **Claude Code or DSH as the embedded runtime.** Claude Code is the strongest agent but its
+  print-mode permissions are CLI-shaped; DSH is the best build harness but a heavy
+  Node/Electron dependency. Pi's RPC mode is built for custom UIs.
+- **A Rust agent framework (Pydantic-AI analogue) or a hand-rolled loop.** The MCP server is the
+  typed tool layer; Pi supplies sessions, streaming, abort and compaction.
+- **Email ingestion** (Outlook COM/IMAP/Graph/MCP) and **calendar-aware scheduling**. Out of
+  scope for this version.
+- **Pixel-first Miro model.** Agents would write coordinates; instead layout is derived and
+  humans pin only where taste matters.
+- **Two inputs (capture bar + AI chat).** One composer with a Tab mode switch.
+- **Unrestricted SQLite access.** DML-only authorizer, FK/integrity/invariant checks, automatic
+  snapshots; DDL belongs to migrations.
+- **A web/Tauri UI.** Kept egui/eframe; the native canvas and hotkey path are already fast.
+- **Search/command palette, recurrence, multi-board, sync.** Deferred; FTS5 is scaffolded but no
+  UI yet.
+
 ## Current state
 
 - `main` at `96bc516`; ~1.6k LOC; **28 tests green**.
