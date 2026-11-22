@@ -157,6 +157,26 @@ pub fn run_guarded(conn: &mut Connection, sql: &str) -> Result<QueryResult, SqlE
     result
 }
 
+/// Run one read-only statement on a separate read-only connection.
+///
+/// This is the board_query path: the connection itself refuses writes
+/// (SQLITE_OPEN_READ_ONLY plus query_only) and the keyword guard keeps DML,
+/// pragmas and transaction control out before the engine sees them. Results
+/// use the same row and byte caps as board_sql.
+pub fn run_read_only(db_path: &std::path::Path, sql: &str) -> Result<QueryResult, SqlError> {
+    let keyword =
+        first_keyword(sql).ok_or_else(|| SqlError::Rejected("empty SQL statement".to_owned()))?;
+    if !matches!(keyword.as_str(), "SELECT" | "WITH" | "VALUES" | "EXPLAIN") {
+        return Err(SqlError::Rejected(format!(
+            "{keyword} is not a read-only statement"
+        )));
+    }
+
+    let conn = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    conn.pragma_update(None, "query_only", true)?;
+    run_inner(&conn, sql)
+}
+
 fn run_inner(conn: &Connection, sql: &str) -> Result<QueryResult, SqlError> {
     let mut statement = conn.prepare(sql)?;
     let columns: Vec<String> = statement.column_names().map(str::to_owned).collect();
@@ -367,6 +387,31 @@ mod tests {
         // Ordinary functions stay usable.
         let result = run_guarded(store.connection_mut(), "SELECT upper('a') AS up").expect("upper");
         assert_eq!(result.rows[0][0], "A");
+    }
+
+    #[test]
+    fn read_only_queries_cannot_write_and_reject_dml_keywords() {
+        let store = store_with_note("mcp-query");
+        let db = store.path().to_path_buf();
+        let result = run_read_only(&db, "SELECT text FROM notes").expect("select");
+        assert_eq!(result.rows[0][0], "kept");
+
+        for statement in [
+            "INSERT INTO notes (id, text, created_at_utc_ms, updated_at_utc_ms) VALUES ('x','y',1,1)",
+            "UPDATE notes SET text = 'x'",
+            "DELETE FROM notes",
+            "PRAGMA foreign_keys = OFF",
+            "BEGIN",
+        ] {
+            assert!(
+                run_read_only(&db, statement).is_err(),
+                "{statement} must be rejected"
+            );
+        }
+        // The connection is read-only even if something slips through: the
+        // note count is unchanged.
+        let result = run_read_only(&db, "SELECT COUNT(*) FROM notes").expect("count");
+        assert_eq!(result.rows[0][0], 1);
     }
 
     #[test]
