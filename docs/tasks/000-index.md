@@ -290,10 +290,15 @@ modules to `src/lib.rs`, not `src/main.rs`.
 
 ### Progress (updated by the integrator)
 
-Completed and merged on `main`: **005, 010, 020, 030, 040, 060, 070, 080, 140, 150, 160**.
-In flight when this note was written: 050 (history), 090 (composer), 120 (Pi bridge).
-Part 1 of 110 (the guarded `board_sql` execution pipeline in `src/mcp/sql.rs`) is merged; the
-rmcp tool surface and the `rustboard-mcp` binary remain.
+Completed and merged on `main`: **005, 010, 020, 030, 040, 050, 060, 070, 080, 090, 120,
+140, 150, 160**. Part of **170** (`src/config.rs`, safe per-field fallbacks) is merged too.
+Part 1 of **110** (the guarded `board_sql` pipeline and read-only query helper in
+`src/mcp/sql.rs`) is merged; the rmcp tool surface and the `rustboard-mcp` binary remain.
+
+Still to do: **100** (canvas for the new model, needs the 170 wiring), the rest of **110**,
+**130** (chat panel, in progress), and **170** (app integration: store, load/poll, composer,
+chat, reminders, tray/hotkey/toasts, delete `persist.rs`/`board.rs`/`ron`, toolbar, README,
+build script).
 
 Build note for parallel agents: the shared `target/shared` directory can hand cargo another
 worktree's `rustboard` test binary. Before final gates, set
