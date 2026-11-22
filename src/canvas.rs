@@ -79,6 +79,7 @@ fn fit_view(app: &mut RustboardApp, canvas_rect: Rect) {
     } else {
         app.camera.reset_to_origin();
     }
+    app.mark_dirty();
 }
 
 fn handle_wheel(app: &mut RustboardApp, ui: &mut Ui, canvas_rect: Rect) {
@@ -275,6 +276,7 @@ fn paint_grid(painter: &egui::Painter, camera: &Camera, canvas_rect: Rect) {
 fn paint_notes(app: &mut RustboardApp, ui: &mut Ui, canvas_rect: Rect) {
     let zoom = app.camera.zoom;
     let mut selection_update: Option<Option<NoteId>> = None;
+    let mut text_changed = false;
     let focus_target = app.pending_focus.take();
     let mut focus_used = false;
 
@@ -348,6 +350,7 @@ fn paint_notes(app: &mut RustboardApp, ui: &mut Ui, canvas_rect: Rect) {
             .add_sized(editor_rect.size(), text_edit)
             .accessible_name(format!("Note text {}", note.id));
 
+        text_changed |= response.changed();
         if response.clicked() || response.has_focus() {
             selection_update = Some(Some(note.id));
         }
@@ -357,6 +360,9 @@ fn paint_notes(app: &mut RustboardApp, ui: &mut Ui, canvas_rect: Rect) {
         }
     }
 
+    if text_changed {
+        app.mark_dirty();
+    }
     if let Some(selection) = selection_update {
         app.update(AppAction::Select(selection));
     }

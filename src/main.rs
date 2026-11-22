@@ -6,6 +6,7 @@ mod camera;
 mod canvas;
 #[cfg(test)]
 mod headless_tests;
+mod persist;
 mod theme;
 
 use eframe::egui;
