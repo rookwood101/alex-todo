@@ -83,6 +83,13 @@ pub enum Command {
         id: NoteId,
         important: bool,
     },
+    /// Wrap notes in a new container that takes the first note's place (its
+    /// parent, position and pin). The new id is the batch's first new note.
+    Wrap {
+        ids: Vec<NoteId>,
+        #[serde(default)]
+        text: String,
+    },
     SetDue {
         id: NoteId,
         #[serde(default)]
@@ -143,6 +150,7 @@ impl Command {
             Self::SetText { .. } => "set_text",
             Self::SetParent { .. } => "set_parent",
             Self::SetImportant { .. } => "set_important",
+            Self::Wrap { .. } => "wrap",
             Self::SetDue { .. } => "set_due",
             Self::SetRemind { .. } => "set_remind",
             Self::Snooze { .. } => "snooze",
@@ -518,6 +526,111 @@ fn resolve_container_path(
     parent.ok_or_else(|| invalid("container name is empty"))
 }
 
+/// Move `id` under `parent` (root when None), optionally before a sibling.
+/// Returns the number of rows written.
+fn set_parent(
+    ctx: &mut Ctx<'_>,
+    tx: &Transaction<'_>,
+    command: &Command,
+    id: &str,
+    parent: Option<&str>,
+    before: Option<&str>,
+) -> Result<usize, CommandError> {
+    let before_note = ensure_active_note(tx, id)?;
+    if parent.is_some() {
+        ensure_not_inbox(&before_note, "nested")?;
+    }
+    if let Some(parent_id) = parent {
+        if parent_id == id {
+            return Err(CommandError::Cycle);
+        }
+        ensure_active_note(tx, parent_id)?;
+        ensure_no_cycle(tx, id, parent_id)?;
+    }
+    // A child cannot stay pinned: pinned positions belong to roots.
+    let unpin = parent.is_some() && before_note.layout == LayoutMode::Pinned;
+    if unpin {
+        tx.execute(
+            "UPDATE notes SET parent_id = ?1, layout_mode = 'flow', pos_x = NULL, pos_y = NULL
+              WHERE id = ?2 AND deleted_at_utc_ms IS NULL",
+            params![parent, id],
+        )?;
+    } else {
+        tx.execute(
+            "UPDATE notes SET parent_id = ?1 WHERE id = ?2 AND deleted_at_utc_ms IS NULL",
+            params![parent, id],
+        )?;
+    }
+    let moved = before_note.parent.as_deref() != parent;
+    let mut affected = 1;
+    if before.is_some() || moved {
+        affected += reorder_siblings(ctx, tx, command, id, parent, before)?;
+    }
+    let after = reload_note(tx, id)?;
+    emit_note(ctx, tx, command, &before_note, &after)?;
+    Ok(affected)
+}
+
+fn wrap(
+    ctx: &mut Ctx<'_>,
+    tx: &Transaction<'_>,
+    command: &Command,
+    ids: &[NoteId],
+    text: &str,
+) -> Result<Effect, CommandError> {
+    let Some(first_id) = ids.first() else {
+        return Err(invalid("wrap needs at least one note"));
+    };
+    let first = ensure_active_note(tx, first_id)?;
+    for id in ids {
+        ensure_not_inbox(&ensure_active_note(tx, id)?, "wrapped")?;
+    }
+    let container = new_id();
+    let (layout, pos_x, pos_y) = match (first.layout, first.pos) {
+        (LayoutMode::Pinned, Some(pos)) => {
+            ("pinned", Some(f64::from(pos.x)), Some(f64::from(pos.y)))
+        }
+        _ => ("flow", None, None),
+    };
+    tx.execute(
+        "INSERT INTO notes (id, text, parent_id, layout_mode, pos_x, pos_y, sort_order, status,
+                            source, created_at_utc_ms, updated_at_utc_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'open', 'human', ?8, ?8)",
+        params![
+            container,
+            text.trim(),
+            first.parent,
+            layout,
+            pos_x,
+            pos_y,
+            first.sort,
+            ctx.now
+        ],
+    )?;
+    let note = reload_note(tx, &container)?;
+    ctx.event(
+        tx,
+        command,
+        "note",
+        &container,
+        None,
+        Some(to_value(&note)?),
+    )?;
+    ctx.new_ids.notes.push(container.clone());
+    let mut affected = 1 + reorder_siblings(
+        ctx,
+        tx,
+        command,
+        &container,
+        first.parent.as_deref(),
+        Some(first_id),
+    )?;
+    for id in ids {
+        affected += set_parent(ctx, tx, command, id, Some(&container), None)?;
+    }
+    Ok(effect_for(command, "note", &container, affected))
+}
+
 fn ensure_not_inbox(note: &Note, action: &'static str) -> Result<(), CommandError> {
     if note.inbox {
         Err(CommandError::Inbox { action })
@@ -666,41 +779,10 @@ fn apply_one(
             Ok(effect_for(command, "note", id, 1))
         }
         Command::SetParent { id, parent, before } => {
-            let before_note = ensure_active_note(tx, id)?;
-            if parent.is_some() {
-                ensure_not_inbox(&before_note, "nested")?;
-            }
-            if let Some(parent_id) = parent {
-                if parent_id == id {
-                    return Err(CommandError::Cycle);
-                }
-                ensure_active_note(tx, parent_id)?;
-                ensure_no_cycle(tx, id, parent_id)?;
-            }
-            // A child cannot stay pinned: pinned positions belong to roots.
-            let unpin = parent.is_some() && before_note.layout == LayoutMode::Pinned;
-            if unpin {
-                tx.execute(
-                    "UPDATE notes SET parent_id = ?1, layout_mode = 'flow', pos_x = NULL, pos_y = NULL
-                      WHERE id = ?2 AND deleted_at_utc_ms IS NULL",
-                    params![parent, id],
-                )?;
-            } else {
-                tx.execute(
-                    "UPDATE notes SET parent_id = ?1 WHERE id = ?2 AND deleted_at_utc_ms IS NULL",
-                    params![parent, id],
-                )?;
-            }
-            let moved = before_note.parent != *parent;
-            let mut affected = 1;
-            if before.is_some() || moved {
-                affected +=
-                    reorder_siblings(ctx, tx, command, id, parent.as_deref(), before.as_deref())?;
-            }
-            let after = reload_note(tx, id)?;
-            emit_note(ctx, tx, command, &before_note, &after)?;
+            let affected = set_parent(ctx, tx, command, id, parent.as_deref(), before.as_deref())?;
             Ok(effect_for(command, "note", id, affected))
         }
+        Command::Wrap { ids, text } => wrap(ctx, tx, command, ids, text),
         Command::SetImportant { id, important } => {
             let before = ensure_active_note(tx, id)?;
             tx.execute(
@@ -1711,6 +1793,55 @@ mod tests {
                 None,
             )
             .expect("relink");
+    }
+
+    #[test]
+    fn wrap_puts_notes_in_a_new_container_at_the_first_notes_place() {
+        let mut store = store("cmd-wrap");
+        let a = add(&mut store, "a");
+        let b = add(&mut store, "b");
+        let c = add(&mut store, "c");
+        let applied = store
+            .apply(
+                &[Command::Wrap {
+                    ids: vec![b.clone(), c.clone()],
+                    text: String::new(),
+                }],
+                Actor::Human,
+                None,
+            )
+            .expect("wrap");
+        let container = applied.new_ids.notes[0].clone();
+        let board = board(&store);
+        let roots: Vec<&str> = board
+            .children(None)
+            .iter()
+            .map(|note| note.id.as_str())
+            .collect();
+        assert_eq!(roots, vec![a.as_str(), container.as_str()]);
+        let kids: Vec<&str> = board
+            .children(Some(&container))
+            .iter()
+            .map(|note| note.id.as_str())
+            .collect();
+        assert_eq!(kids, vec![b.as_str(), c.as_str()]);
+        let error = store
+            .apply(
+                &[Command::Wrap {
+                    ids: vec![b.clone(), container.clone()],
+                    text: String::new(),
+                }],
+                Actor::Human,
+                None,
+            )
+            .expect_err("a container cannot move into a box inside itself");
+        assert!(
+            matches!(
+                error,
+                CommandError::At { ref source, .. } if matches!(**source, CommandError::Cycle)
+            ) || error.to_string().contains("ancestor"),
+            "{error}"
+        );
     }
 
     #[test]

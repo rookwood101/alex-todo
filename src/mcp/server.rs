@@ -195,7 +195,7 @@ mod tests {
             .and_then(|items| items.get("oneOf"))
             .and_then(serde_json::Value::as_array)
             .expect("command variants");
-        assert_eq!(variants.len(), 16, "every Command variant is described");
+        assert_eq!(variants.len(), 17, "every Command variant is described");
         let schema_text = serde_json::to_string(variants).expect("encode");
         assert!(
             !schema_text.contains("group") && !schema_text.contains("priority"),
