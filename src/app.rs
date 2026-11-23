@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use crate::agent::{
     AgentEvent, AgentHarness, PiConfig, PiHarness, PiProfile, ensure_mcp_config, find_on_path,
-    mcp_command_path,
+    mcp_command_path, pi_agent_dir, pi_default_model, vertex_credentials_problem,
 };
 use crate::command::{Actor, Applied, Command};
 use crate::config::{Config, Profile};
@@ -133,7 +133,6 @@ pub struct RustboardApp {
     settings_open: bool,
     settings_hotkey: String,
     settings_tz: String,
-    settings_model: String,
     settings_profile: Profile,
     settings_reminder: u64,
     quitting: bool,
@@ -164,7 +163,6 @@ impl RustboardApp {
             store_error: None,
             settings_hotkey: config.hotkey.clone(),
             settings_tz: config.tz.clone().unwrap_or_default(),
-            settings_model: config.pi_model.clone(),
             settings_profile: config.pi_profile,
             settings_reminder: config.reminder_minutes,
             config_warnings: warnings,
@@ -200,6 +198,9 @@ impl RustboardApp {
             app.start_notifications();
         }
         app.open_store();
+        if full {
+            app.chat.default_model = pi_agent_dir().and_then(|dir| pi_default_model(&dir));
+        }
         if full && app.store.is_some() {
             app.start_agent_in_background();
         }
@@ -413,7 +414,9 @@ impl RustboardApp {
     /// waiting for the first prompt. Missing prerequisites stay silent here;
     /// they are reported when the user sends.
     fn start_agent_in_background(&mut self) {
-        if find_on_path("pi").is_none() || !mcp_command_path().is_ok_and(|path| path.is_file()) {
+        if let Some(problem) = Self::agent_prerequisite_error() {
+            // Show it up front so the user knows before typing a prompt.
+            self.chat.error = Some(problem);
             return;
         }
         let Ok(harness) = self.ensure_harness() else {
@@ -435,6 +438,9 @@ impl RustboardApp {
                  `npm i -g @earendil-works/pi-coding-agent@1.6.0`, then restart Rustboard."
                     .to_owned(),
             );
+        }
+        if let Some(problem) = pi_agent_dir().and_then(|dir| vertex_credentials_problem(&dir)) {
+            return Some(problem);
         }
         match mcp_command_path() {
             Ok(path) if path.is_file() => None,
@@ -460,8 +466,6 @@ impl RustboardApp {
             return Err(format!("Cannot write the Pi MCP config: {error}"));
         }
         let mut config = PiConfig::new(self.paths.home(), self.agent_profile);
-        config.model = self.config.pi_model.clone();
-        config.provider = self.config.pi_provider.clone();
         config.session_dir = Some(self.paths.home().join("pi-sessions"));
         config.continue_session = true;
         let harness = PiHarness::new(config);
@@ -752,6 +756,15 @@ impl RustboardApp {
                 });
             }
         }
+        if let Some((provider, model)) = output.model_selected
+            && let Some(harness) = self.harness.clone()
+        {
+            std::thread::spawn(move || {
+                if let Err(error) = harness.set_model(&provider, &model) {
+                    eprintln!("rustboard: cannot switch model: {error}");
+                }
+            });
+        }
         if output.clear_requested
             && let Some(harness) = self.harness.clone()
         {
@@ -911,7 +924,13 @@ impl RustboardApp {
                         ui.end_row();
 
                         ui.label("Pi model");
-                        ui.text_edit_singleline(&mut self.settings_model);
+                        ui.label(
+                            RichText::new(
+                                "Set in Pi's settings.json; switch per conversation in the chat header",
+                            )
+                            .size(11.0)
+                            .color(theme::TEXT_MUTED),
+                        );
                         ui.end_row();
 
                         ui.label("Pi profile");
@@ -983,7 +1002,6 @@ impl RustboardApp {
         self.config.tz =
             (!self.settings_tz.trim().is_empty()).then(|| self.settings_tz.trim().to_owned());
         self.board_tz = self.config.zone();
-        self.config.pi_model = self.settings_model.trim().to_owned();
         self.config.pi_profile = self.settings_profile;
         self.config.reminder_minutes = self.settings_reminder.clamp(1, 1440);
         match self.config.save(Config::path_for(&self.paths)) {

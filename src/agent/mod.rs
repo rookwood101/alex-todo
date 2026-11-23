@@ -27,7 +27,9 @@ mod shared;
 #[cfg(test)]
 mod test_support;
 
-pub use config::{PiConfig, find_on_path};
+pub use config::{
+    PiConfig, find_on_path, pi_agent_dir, pi_default_model, vertex_credentials_problem,
+};
 pub use harness::PiHarness;
 pub use mcp::{ensure_mcp_config, mcp_command_path};
 
@@ -55,6 +57,10 @@ pub enum AgentEvent {
     ToolEnd { id: String, name: String, ok: bool },
     /// The resumed session's earlier messages (answer to `get_messages`).
     History(Vec<HistoryMessage>),
+    /// Models Pi can use with the configured auth (`get_available_models`).
+    Models(Vec<ModelChoice>),
+    /// The model this session uses (`get_state` or a successful `set_model`).
+    CurrentModel(Option<ModelChoice>),
     /// Pi settled after a turn. `reason` is `completed`, `aborted`, or
     /// `error`.
     TurnEnd { reason: String },
@@ -76,6 +82,15 @@ pub struct HistoryMessage {
     /// True for the user's prompts, false for assistant replies.
     pub user: bool,
     pub text: String,
+}
+
+/// One model Pi offers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelChoice {
+    pub provider: String,
+    pub id: String,
+    /// Display name (falls back to the id).
+    pub name: String,
 }
 
 /// Lifecycle state of an [`AgentHarness`].
@@ -149,6 +164,9 @@ pub trait AgentHarness: Send + Sync {
     fn stop(&self) -> Result<(), AgentError>;
     /// Start a fresh conversation (Clear). Pi forgets the earlier context.
     fn new_session(&self) -> Result<(), AgentError>;
+    /// Switch this session's model (Pi keeps it in the session, not in its
+    /// global settings).
+    fn set_model(&self, provider: &str, id: &str) -> Result<(), AgentError>;
     /// Current lifecycle state.
     fn status(&self) -> AgentStatus;
     /// Event receiver. Call once and fan out if several consumers are needed:

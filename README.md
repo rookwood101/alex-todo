@@ -40,8 +40,22 @@ multi-board and sync.
 - For the agent: Node 22.19+ and Pi 1.6.0:
 
       npm i -g @earendil-works/pi-coding-agent@1.6.0
-      pi auth login deepseek        # or set DEEPSEEK_API_KEY
-      pi --list-models deepseek
+
+  Rustboard does not choose the model: Pi's own <code>%USERPROFILE%\.pi\agent\settings.json</code>
+  (<code>defaultProvider</code>/<code>defaultModel</code>) and <code>auth.json</code> do. For
+  Gemini on Vertex AI in the EU:
+
+      // settings.json
+      {"defaultProvider": "google-vertex", "defaultModel": "gemini-4-carbon"}
+      // auth.json
+      {"google-vertex": {"type": "api_key", "env": {
+        "GOOGLE_CLOUD_PROJECT": "<project>",
+        "GOOGLE_CLOUD_LOCATION": "eu",
+        "GOOGLE_APPLICATION_CREDENTIALS": "<path to application_default_credentials.json>"}}}
+
+  On Windows set <code>GOOGLE_APPLICATION_CREDENTIALS</code> explicitly: Pi looks for ADC only
+  under <code>~/.config/gcloud</code>. The chat header's model menu switches the model for the
+  current conversation.
 
 ## Run
 

@@ -8,10 +8,6 @@ use std::path::{Path, PathBuf};
 
 pub use super::PiProfile;
 
-/// Default model measured in 005.
-pub const DEFAULT_MODEL: &str = "deepseek-flash";
-/// Default provider measured in 005.
-pub const DEFAULT_PROVIDER: &str = "deepseek";
 /// Default Pi shim name; resolves through PATH on Windows.
 pub const DEFAULT_EXECUTABLE: &str = "pi";
 /// Tool name exposed by the rustboard MCP server when registered directly.
@@ -52,10 +48,11 @@ impl PiProfile {
 pub struct PiConfig {
     /// Pi executable, normally `pi`. On Windows this is resolved by `cmd.exe`.
     pub executable: String,
-    /// Pi model id (no provider prefix; `--provider` is separate).
-    pub model: String,
-    /// Pi provider id.
-    pub provider: String,
+    /// Pi model id override. None (the default) leaves the choice to Pi's own
+    /// settings (`defaultProvider`/`defaultModel` in ~/.pi/agent/settings.json).
+    pub model: Option<String>,
+    /// Pi provider id override; used only together with `model`.
+    pub provider: Option<String>,
     /// Working directory for Pi; also where `.pi/mcp.json` lives.
     pub board_home: PathBuf,
     /// Tool profile.
@@ -81,8 +78,8 @@ impl PiConfig {
     pub fn new(board_home: impl Into<PathBuf>, profile: PiProfile) -> Self {
         Self {
             executable: DEFAULT_EXECUTABLE.to_owned(),
-            model: DEFAULT_MODEL.to_owned(),
-            provider: DEFAULT_PROVIDER.to_owned(),
+            model: None,
+            provider: None,
             board_home: board_home.into(),
             profile,
             extra_args: Vec::new(),
@@ -112,12 +109,14 @@ impl PiConfig {
             }
             None => args.push("--no-session".to_owned()),
         }
-        args.extend([
-            "--provider".to_owned(),
-            self.provider.clone(),
-            "--model".to_owned(),
-            self.model.clone(),
-        ]);
+        if let (Some(provider), Some(model)) = (&self.provider, &self.model) {
+            args.extend([
+                "--provider".to_owned(),
+                provider.clone(),
+                "--model".to_owned(),
+                model.clone(),
+            ]);
+        }
         args.extend(profile.tool_args().iter().map(|arg| (*arg).to_owned()));
         args.extend(self.extra_args.iter().cloned());
         args
@@ -206,6 +205,50 @@ pub fn find_on_path(name: &str) -> Option<PathBuf> {
     })
 }
 
+/// Pi's agent folder: `PI_CODING_AGENT_DIR`, else `~/.pi/agent`.
+pub fn pi_agent_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("PI_CODING_AGENT_DIR").filter(|dir| !dir.is_empty()) {
+        return Some(PathBuf::from(dir));
+    }
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .filter(|home| !home.is_empty())?;
+    Some(PathBuf::from(home).join(".pi").join("agent"))
+}
+
+fn read_json(path: &Path) -> Option<serde_json::Value> {
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+}
+
+/// Pi's global default (provider, model id) from its settings.json.
+pub fn pi_default_model(agent_dir: &Path) -> Option<(String, String)> {
+    let settings = read_json(&agent_dir.join("settings.json"))?;
+    let provider = settings.get("defaultProvider")?.as_str()?.to_owned();
+    let model = settings.get("defaultModel")?.as_str()?.to_owned();
+    Some((provider, model))
+}
+
+/// A readable message when Pi's google-vertex entry points at a credentials
+/// file that cannot be read (for example a WSL path while WSL is stopped).
+pub fn vertex_credentials_problem(agent_dir: &Path) -> Option<String> {
+    let auth = read_json(&agent_dir.join("auth.json"))?;
+    let path = auth
+        .get("google-vertex")?
+        .get("env")?
+        .get("GOOGLE_APPLICATION_CREDENTIALS")?
+        .as_str()?;
+    if std::fs::metadata(path).is_ok_and(|meta| meta.is_file()) {
+        return None;
+    }
+    Some(format!(
+        "Vertex credentials are not readable at {path}. If this is a WSL path, start WSL \
+         (open a WSL terminal) and try again, or copy the file to \
+         %APPDATA%\\gcloud\\application_default_credentials.json and point \
+         GOOGLE_APPLICATION_CREDENTIALS there in {}.",
+        agent_dir.join("auth.json").display()
+    ))
+}
+
 /// A resolved executable and arguments. On Windows `raw_command_line` is
 /// appended verbatim with `CommandExt::raw_arg`; elsewhere `args` is used.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -285,6 +328,59 @@ mod tests {
     }
 
     #[test]
+    fn pi_settings_are_read_and_unreadable_vertex_credentials_are_reported() {
+        let dir = std::env::temp_dir().join(format!("rustboard-pi-agent-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        assert_eq!(pi_default_model(&dir), None);
+        assert_eq!(
+            vertex_credentials_problem(&dir),
+            None,
+            "no auth.json, nothing to check"
+        );
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"defaultProvider":"google-vertex","defaultModel":"gemini-4-carbon"}"#,
+        )
+        .expect("settings");
+        assert_eq!(
+            pi_default_model(&dir),
+            Some(("google-vertex".to_owned(), "gemini-4-carbon".to_owned()))
+        );
+        let missing = dir.join("missing-adc.json");
+        std::fs::write(
+            dir.join("auth.json"),
+            serde_json::json!({"google-vertex": {"type": "api_key", "env": {
+                "GOOGLE_APPLICATION_CREDENTIALS": missing.display().to_string()
+            }}})
+            .to_string(),
+        )
+        .expect("auth");
+        let problem = vertex_credentials_problem(&dir).expect("missing file is reported");
+        assert!(problem.contains("not readable"), "{problem}");
+        std::fs::write(&missing, "{}").expect("adc");
+        assert_eq!(vertex_credentials_problem(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn provider_and_model_flags_appear_only_when_both_are_set() {
+        let mut config = config(PiProfile::Board);
+        assert!(!config.pi_args().contains(&"--model".to_owned()));
+        config.model = Some("gemini-4-carbon".to_owned());
+        assert!(!config.pi_args().contains(&"--model".to_owned()));
+        config.provider = Some("google-vertex".to_owned());
+        let args = config.pi_args();
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--provider", "google-vertex"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--model", "gemini-4-carbon"])
+        );
+    }
+
+    #[test]
     fn board_profile_has_exactly_the_shell_free_tool_flags() {
         let config = config(PiProfile::Board);
         assert_eq!(
@@ -293,10 +389,6 @@ mod tests {
                 "--mode",
                 "rpc",
                 "--no-session",
-                "--provider",
-                "deepseek",
-                "--model",
-                "deepseek-flash",
                 "--no-builtin-tools",
                 "--tools",
                 "mcp__rustboard__*",
@@ -332,10 +424,6 @@ mod tests {
                 "--mode",
                 "rpc",
                 "--no-session",
-                "--provider",
-                "deepseek",
-                "--model",
-                "deepseek-flash",
                 "--tools",
                 "read,bash,powershell,edit,write,grep,find,ls,mcp__rustboard__*",
                 "--approve",
@@ -365,7 +453,7 @@ mod tests {
         let plan = config.launch_plan();
         assert_eq!(plan.program, "cmd.exe");
         assert_eq!(plan.args, vec!["/d", "/s", "/c"]);
-        let expected = r#""pi --mode rpc --no-session --provider deepseek --model deepseek-flash --no-builtin-tools --tools mcp__rustboard__* --approve""#;
+        let expected = r#""pi --mode rpc --no-session --no-builtin-tools --tools mcp__rustboard__* --approve""#;
         assert_eq!(plan.raw_command_line.as_deref(), Some(expected));
     }
 
@@ -397,7 +485,7 @@ mod tests {
         config.extra_args = vec!["--thinking".to_owned(), "low".to_owned()];
         let args = config.pi_args();
         assert_eq!(&args[args.len() - 2..], &["--thinking", "low"]);
-        assert_eq!(args[7], "--no-builtin-tools");
+        assert_eq!(args[3], "--no-builtin-tools");
     }
 
     #[test]

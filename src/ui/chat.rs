@@ -27,7 +27,7 @@ use crossbeam_channel::Receiver;
 use eframe::egui::{self, Align2, Id, Margin, RichText, Stroke, vec2};
 use rusqlite::Connection;
 
-use crate::agent::{AgentEvent, PiProfile};
+use crate::agent::{AgentEvent, ModelChoice, PiProfile};
 use crate::command::Actor;
 use crate::history::{self, BatchKind, HistoryError};
 use crate::model::BatchId;
@@ -236,6 +236,12 @@ pub struct ChatState {
     /// [end_turn] merges these with the rows returned by [TurnHistory] and
     /// deduplicates the result into last_turn_batches.
     pub pending_turn_batches: Vec<BatchId>,
+    /// Models Pi offers for the configured auth.
+    pub models: Vec<ModelChoice>,
+    /// The model the session uses, once Pi has reported it.
+    pub current_model: Option<ModelChoice>,
+    /// Pi's global default (provider, model id) from its settings.json.
+    pub default_model: Option<(String, String)>,
 }
 
 impl ChatState {
@@ -358,6 +364,12 @@ impl ChatState {
                 self.streaming.truncate(trimmed);
                 self.finalize_streaming();
                 self.busy = false;
+            }
+            AgentEvent::Models(models) => {
+                self.models = models;
+            }
+            AgentEvent::CurrentModel(model) => {
+                self.current_model = model;
             }
             AgentEvent::Cost {
                 input_tokens,
@@ -524,6 +536,8 @@ pub struct ChatOutput {
     pub prompt: Option<String>,
     /// The mode badge was pressed; restart the harness with state.mode.profile().
     pub mode_toggled: bool,
+    /// A model was picked: (provider, model id) for AgentHarness::set_model.
+    pub model_selected: Option<(String, String)>,
 }
 
 /// Draw the floating chat panel and report the controls the user pressed.
@@ -630,6 +644,7 @@ fn header(ui: &mut egui::Ui, state: &mut ChatState, output: &mut ChatOutput) {
             output.mode_toggled = true;
         }
 
+        model_picker(ui, state, output);
         ui.add_space(6.0);
         if state.busy {
             ui.label(
@@ -687,6 +702,52 @@ fn header(ui: &mut egui::Ui, state: &mut ChatState, output: &mut ChatOutput) {
     });
 }
 
+/// The model dropdown: lists Pi's models and marks Pi's global default.
+fn model_picker(ui: &mut egui::Ui, state: &ChatState, output: &mut ChatOutput) {
+    let is_default = |model: &ModelChoice| {
+        state
+            .default_model
+            .as_ref()
+            .is_some_and(|(provider, id)| *provider == model.provider && *id == model.id)
+    };
+    let label = |model: &ModelChoice| {
+        if is_default(model) {
+            format!("{} (default)", model.name)
+        } else {
+            model.name.clone()
+        }
+    };
+    let selected = state
+        .current_model
+        .as_ref()
+        .map_or_else(|| "model…".to_owned(), label);
+    egui::ComboBox::from_id_salt("rustboard.chat.model")
+        .selected_text(RichText::new(selected).size(11.0))
+        .width(200.0)
+        .show_ui(ui, |ui| {
+            if state.models.is_empty() {
+                ui.label(
+                    RichText::new("Pi has not listed any models yet")
+                        .size(11.0)
+                        .color(theme::TEXT_MUTED),
+                );
+            }
+            for model in &state.models {
+                let current = state.current_model.as_ref() == Some(model);
+                if ui
+                    .selectable_label(current, label(model))
+                    .on_hover_text(format!("{}/{}", model.provider, model.id))
+                    .clicked()
+                    && !current
+                {
+                    output.model_selected = Some((model.provider.clone(), model.id.clone()));
+                }
+            }
+        })
+        .response
+        .on_hover_text("Model for this conversation (Pi keeps your global default)");
+}
+
 /// The one-line bar shown while the transcript is empty and idle.
 fn collapsed_bar(ui: &mut egui::Ui, state: &mut ChatState, output: &mut ChatOutput) {
     ui.horizontal(|ui| {
@@ -708,8 +769,9 @@ fn collapsed_bar(ui: &mut egui::Ui, state: &mut ChatState, output: &mut ChatOutp
             state.mode = state.mode.toggled();
             output.mode_toggled = true;
         }
+        model_picker(ui, state, output);
         ui.label(
-            RichText::new("Agent ready \u{b7} press Tab in the composer to ask")
+            RichText::new("Tab in the composer asks the agent")
                 .size(11.0)
                 .color(theme::TEXT_MUTED),
         );
