@@ -91,7 +91,8 @@ fn ensure_mcp_config_with_command(
     Ok(path)
 }
 
-fn mcp_command_path() -> Result<PathBuf, AgentError> {
+/// Where rustboard-mcp is expected: next to the running executable.
+pub fn mcp_command_path() -> Result<PathBuf, AgentError> {
     let executable = std::env::current_exe().map_err(|error| {
         AgentError::Mcp(format!("cannot locate the current executable: {error}"))
     })?;

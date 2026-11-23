@@ -24,6 +24,8 @@ Built with Rust, [egui/eframe](https://github.com/emilk/egui) on WGPU, <code>rus
 - Every mutation is one batch with before/after events; undo and redo are new batches, so history
   is append-only and never rewritten.
 - Chat panel above the composer: streaming text, tool chips, stop, cost and **Undo this turn**.
+  The conversation persists across restarts (Pi sessions in <code>pi-sessions/</code>); **Clear**
+  starts a new one. Pi's stderr and events are logged to <code>logs/pi.log</code>.
 - Reminders run on their own thread (snooze, done, missed-summary), with real Windows toasts.
 - Tray icon, two-key global hotkey (<code>Ctrl+Space</code>), X/Esc hide-to-tray, single instance.
 - CLI (<code>todo</code>) and MCP stdio server (<code>rustboard-mcp</code>) share the same command

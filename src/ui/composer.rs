@@ -107,6 +107,8 @@ pub struct ComposerOutput {
     pub agent_prompt: Option<String>,
     /// The syntax explainer was switched on (true) or off (false).
     pub help_toggled: Option<bool>,
+    /// Height of the floating panel this frame (the chat panel sits above).
+    pub panel_height: f32,
 }
 
 /// Persistent state of the composer widget.
@@ -333,7 +335,7 @@ pub fn show(
         .constrain(true)
         .default_width(PANEL_WIDTH);
 
-    area.show(ctx, |ui| {
+    let shown = area.show(ctx, |ui| {
         ui.set_width(PANEL_WIDTH);
 
         egui::Frame::new()
@@ -528,6 +530,8 @@ pub fn show(
                 });
             });
     });
+
+    output.panel_height = shown.response.rect.height() + BOTTOM_OFFSET;
 
     // The TextEdit has been registered for this frame; focusing it now takes
     // effect for the next frame and survives the end-of-pass focus check.

@@ -13,7 +13,10 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::agent::{AgentEvent, AgentHarness, PiConfig, PiHarness, PiProfile, ensure_mcp_config};
+use crate::agent::{
+    AgentEvent, AgentHarness, PiConfig, PiHarness, PiProfile, ensure_mcp_config, find_on_path,
+    mcp_command_path,
+};
 use crate::command::{Actor, Applied, Command};
 use crate::config::{Config, Profile};
 use crate::history;
@@ -136,6 +139,10 @@ pub struct RustboardApp {
     quitting: bool,
     pending_new_note: bool,
     full: bool,
+    /// Height of the composer panel last frame; the chat panel sits above it.
+    composer_height: f32,
+    /// The chat was busy last frame (to refocus the composer when it settles).
+    chat_was_busy: bool,
 }
 
 impl RustboardApp {
@@ -185,12 +192,17 @@ impl RustboardApp {
             quitting: false,
             pending_new_note: false,
             full,
+            composer_height: chat::COMPOSER_CLEARANCE,
+            chat_was_busy: false,
         };
         app.composer.set_help_visible(app.config.show_syntax_help);
         if full {
             app.start_notifications();
         }
         app.open_store();
+        if full && app.store.is_some() {
+            app.start_agent_in_background();
+        }
         if !app.config_warnings.is_empty() {
             let warning = app.config_warnings.join("; ");
             app.set_status(warning, true);
@@ -372,15 +384,66 @@ impl RustboardApp {
                 return;
             }
         };
-        match harness.send(&prompt) {
-            Ok(()) => {
-                self.chat.push_user_message(prompt);
-                chat::begin_turn(&mut self.chat, now_utc_ms());
+        // Record the prompt before sending: a lazy spawn can answer with the
+        // resumed history while send() is still running.
+        self.chat.push_user_message(prompt.clone());
+        chat::begin_turn(&mut self.chat, now_utc_ms());
+        if let Err(error) = harness.send(&prompt) {
+            // Put the prompt back so nothing typed is lost.
+            if self
+                .chat
+                .messages
+                .last()
+                .is_some_and(|message| message.text == prompt)
+            {
+                self.chat.messages.pop();
             }
-            Err(error) => {
-                self.chat.error = Some(error.to_string());
-                self.set_status(format!("Pi: {error}"), true);
+            self.chat.busy = false;
+            self.chat.turn_started_at_utc_ms = None;
+            self.chat.error = Some(error.to_string());
+            if self.composer.text().trim().is_empty() {
+                self.composer.set_text(prompt);
             }
+            self.composer.request_focus();
+            self.set_status(format!("Pi: {error}"), true);
+        }
+    }
+
+    /// Start Pi off the UI thread so the resumed conversation appears without
+    /// waiting for the first prompt. Missing prerequisites stay silent here;
+    /// they are reported when the user sends.
+    fn start_agent_in_background(&mut self) {
+        if find_on_path("pi").is_none() || !mcp_command_path().is_ok_and(|path| path.is_file()) {
+            return;
+        }
+        let Ok(harness) = self.ensure_harness() else {
+            return;
+        };
+        let profile = self.agent_profile;
+        std::thread::spawn(move || {
+            if let Err(error) = harness.start(profile) {
+                eprintln!("rustboard: pi start failed: {error}");
+            }
+        });
+    }
+
+    /// Why the agent cannot run, in words the user can act on.
+    fn agent_prerequisite_error() -> Option<String> {
+        if find_on_path("pi").is_none() {
+            return Some(
+                "Pi is not installed or not on PATH. Install it with \
+                 `npm i -g @earendil-works/pi-coding-agent@1.6.0`, then restart Rustboard."
+                    .to_owned(),
+            );
+        }
+        match mcp_command_path() {
+            Ok(path) if path.is_file() => None,
+            Ok(path) => Some(format!(
+                "The board tools are missing: {} does not exist. Build all binaries \
+                 (`cargo build --bins`) and keep rustboard-mcp next to rustboard.",
+                path.display()
+            )),
+            Err(error) => Some(format!("Cannot locate the board tools: {error}")),
         }
     }
 
@@ -388,13 +451,23 @@ impl RustboardApp {
         if let Some(harness) = &self.harness {
             return Ok(Arc::clone(harness));
         }
+        if self.full
+            && let Some(error) = Self::agent_prerequisite_error()
+        {
+            return Err(error);
+        }
         if let Err(error) = ensure_mcp_config(self.paths.home(), self.paths.db()) {
-            self.set_status(format!("MCP config: {error}"), true);
+            return Err(format!("Cannot write the Pi MCP config: {error}"));
         }
         let mut config = PiConfig::new(self.paths.home(), self.agent_profile);
         config.model = self.config.pi_model.clone();
         config.provider = self.config.pi_provider.clone();
+        config.session_dir = Some(self.paths.home().join("pi-sessions"));
+        config.continue_session = true;
         let harness = PiHarness::new(config);
+        if let Err(error) = harness.set_log(&self.paths.logs().join("pi.log")) {
+            eprintln!("rustboard: cannot open the Pi log: {error}");
+        }
         self.agent_events = Some(harness.events());
         let harness: Arc<dyn AgentHarness> = Arc::new(harness);
         self.harness = Some(Arc::clone(&harness));
@@ -561,8 +634,15 @@ impl RustboardApp {
         self.composer.set_busy(self.chat.busy);
         let composer_context =
             ComposerContext::new(now_utc_ms(), &self.board_tz, &self.group_names);
+        if self.chat_was_busy && !self.chat.busy {
+            self.composer.request_focus();
+        }
+        self.chat_was_busy = self.chat.busy;
         let composer_output =
             composer::show(&mut self.composer, &ctx, self.chat.busy, &composer_context);
+        if composer_output.panel_height > 0.0 {
+            self.composer_height = composer_output.panel_height;
+        }
         if let Some(command) = composer_output.capture
             && let Some(applied) = self.apply_commands(vec![command], "capture")
             && let Some(id) = applied.new_ids.notes.first().cloned()
@@ -638,9 +718,14 @@ impl RustboardApp {
         match self.store.as_ref() {
             Some(store) => {
                 let history = ConnectionTurnHistory::new(store.connection());
-                chat::show(&mut self.chat, ctx, &history)
+                chat::show_above(&mut self.chat, ctx, &history, self.composer_height + 8.0)
             }
-            None => chat::show(&mut self.chat, ctx, &NoTurnHistory),
+            None => chat::show_above(
+                &mut self.chat,
+                ctx,
+                &NoTurnHistory,
+                self.composer_height + 8.0,
+            ),
         }
     }
 
@@ -656,11 +741,25 @@ impl RustboardApp {
         }
         if output.mode_toggled {
             self.agent_profile = self.chat.mode.profile();
-            if let Some(harness) = &self.harness
-                && let Err(error) = harness.start(self.agent_profile)
-            {
-                self.set_status(format!("Cannot switch profile: {error}"), true);
+            if let Some(harness) = self.harness.clone() {
+                // Restarting waits for Pi to exit; keep that off the UI thread.
+                // The session resumes, so the conversation continues.
+                let profile = self.agent_profile;
+                std::thread::spawn(move || {
+                    if let Err(error) = harness.start(profile) {
+                        eprintln!("rustboard: cannot switch profile: {error}");
+                    }
+                });
             }
+        }
+        if output.clear_requested
+            && let Some(harness) = self.harness.clone()
+        {
+            std::thread::spawn(move || {
+                if let Err(error) = harness.new_session() {
+                    eprintln!("rustboard: cannot start a new session: {error}");
+                }
+            });
         }
     }
 

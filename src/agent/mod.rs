@@ -27,9 +27,9 @@ mod shared;
 #[cfg(test)]
 mod test_support;
 
-pub use config::PiConfig;
+pub use config::{PiConfig, find_on_path};
 pub use harness::PiHarness;
-pub use mcp::ensure_mcp_config;
+pub use mcp::{ensure_mcp_config, mcp_command_path};
 
 use crossbeam_channel::Receiver;
 use thiserror::Error;
@@ -46,10 +46,15 @@ pub enum AgentEvent {
     /// An incremental assistant text fragment. `text_end` records do not
     /// repeat text that was already streamed as deltas.
     TextDelta(String),
-    /// A tool call began executing.
-    ToolStart { name: String },
+    /// A new assistant text block started; the UI separates it from earlier
+    /// text in the same turn.
+    TextBreak,
+    /// A tool call began executing. `id` is Pi's toolCallId (may be empty).
+    ToolStart { id: String, name: String },
     /// A tool call finished. `ok` is false when Pi reported `isError: true`.
-    ToolEnd { name: String, ok: bool },
+    ToolEnd { id: String, name: String, ok: bool },
+    /// The resumed session's earlier messages (answer to `get_messages`).
+    History(Vec<HistoryMessage>),
     /// Pi settled after a turn. `reason` is `completed`, `aborted`, or
     /// `error`.
     TurnEnd { reason: String },
@@ -63,6 +68,14 @@ pub enum AgentEvent {
     /// A spawn failure, protocol error, auth error, or unexpected exit.
     /// The harness keeps running where possible; the UI should display this.
     Error(String),
+}
+
+/// One earlier message from a resumed Pi session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryMessage {
+    /// True for the user's prompts, false for assistant replies.
+    pub user: bool,
+    pub text: String,
 }
 
 /// Lifecycle state of an [`AgentHarness`].
@@ -134,6 +147,8 @@ pub trait AgentHarness: Send + Sync {
     fn abort(&self) -> Result<(), AgentError>;
     /// Stop the child and kill its process tree.
     fn stop(&self) -> Result<(), AgentError>;
+    /// Start a fresh conversation (Clear). Pi forgets the earlier context.
+    fn new_session(&self) -> Result<(), AgentError>;
     /// Current lifecycle state.
     fn status(&self) -> AgentStatus;
     /// Event receiver. Call once and fan out if several consumers are needed:

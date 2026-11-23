@@ -69,6 +69,11 @@ pub struct PiConfig {
     /// Defaults to `[/d, /s, /c]` on Windows. Tests point this at a fake
     /// child launcher.
     pub base_args: Option<Vec<String>>,
+    /// Keep Pi sessions in this folder (None runs Pi with `--no-session`).
+    pub session_dir: Option<PathBuf>,
+    /// With a session folder: resume the latest session (`--continue`)
+    /// instead of starting a fresh one.
+    pub continue_session: bool,
 }
 
 impl PiConfig {
@@ -83,6 +88,8 @@ impl PiConfig {
             extra_args: Vec::new(),
             command: None,
             base_args: None,
+            session_dir: None,
+            continue_session: false,
         }
     }
 
@@ -94,15 +101,23 @@ impl PiConfig {
     /// Profile-specific Pi arguments. Kept separate so a restart can switch
     /// modes without mutating the config.
     pub fn pi_args_for(&self, profile: PiProfile) -> Vec<String> {
-        let mut args = vec![
-            "--mode".to_owned(),
-            "rpc".to_owned(),
-            "--no-session".to_owned(),
+        let mut args = vec!["--mode".to_owned(), "rpc".to_owned()];
+        match &self.session_dir {
+            Some(dir) => {
+                args.push("--session-dir".to_owned());
+                args.push(dir.display().to_string());
+                if self.continue_session {
+                    args.push("--continue".to_owned());
+                }
+            }
+            None => args.push("--no-session".to_owned()),
+        }
+        args.extend([
             "--provider".to_owned(),
             self.provider.clone(),
             "--model".to_owned(),
             self.model.clone(),
-        ];
+        ]);
         args.extend(profile.tool_args().iter().map(|arg| (*arg).to_owned()));
         args.extend(self.extra_args.iter().cloned());
         args
@@ -170,6 +185,27 @@ impl PiConfig {
     }
 }
 
+/// Find an executable on PATH, honouring PATHEXT on Windows (pi.cmd, pi.exe).
+pub fn find_on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    let extensions: Vec<String> = if cfg!(windows) {
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_owned())
+            .split(';')
+            .filter(|ext| !ext.is_empty())
+            .map(str::to_owned)
+            .collect()
+    } else {
+        vec![String::new()]
+    };
+    std::env::split_paths(&path).find_map(|dir| {
+        extensions.iter().find_map(|ext| {
+            let candidate = dir.join(format!("{name}{ext}"));
+            candidate.is_file().then_some(candidate)
+        })
+    })
+}
+
 /// A resolved executable and arguments. On Windows `raw_command_line` is
 /// appended verbatim with `CommandExt::raw_arg`; elsewhere `args` is used.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -230,6 +266,22 @@ mod tests {
 
     fn config(profile: PiProfile) -> PiConfig {
         PiConfig::new(PathBuf::from(r"C:\board home"), profile)
+    }
+
+    #[test]
+    fn a_session_folder_replaces_no_session_and_can_continue() {
+        let mut config = config(PiProfile::Board);
+        config.session_dir = Some(PathBuf::from("sessions"));
+        let fresh = config.pi_args();
+        assert!(
+            fresh
+                .windows(2)
+                .any(|pair| pair == ["--session-dir", "sessions"])
+        );
+        assert!(!fresh.contains(&"--no-session".to_owned()));
+        assert!(!fresh.contains(&"--continue".to_owned()));
+        config.continue_session = true;
+        assert!(config.pi_args().contains(&"--continue".to_owned()));
     }
 
     #[test]

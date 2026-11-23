@@ -5,6 +5,9 @@
 //! from a dead process harmless after a restart.
 
 use std::collections::{HashMap, VecDeque};
+use std::fs::File;
+use std::io::Write;
+use std::path::Path;
 use std::process::ExitStatus;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
@@ -26,6 +29,10 @@ pub(crate) struct Shared {
     pending: Mutex<HashMap<String, String>>,
     restart_attempts: AtomicU32,
     give_up: AtomicBool,
+    /// A prompt was sent and its TurnEnd has not been published yet.
+    turn_active: AtomicBool,
+    /// Optional diagnostics log (stderr lines and events).
+    log: Mutex<Option<File>>,
 }
 
 impl Shared {
@@ -38,6 +45,52 @@ impl Shared {
             pending: Mutex::new(HashMap::new()),
             restart_attempts: AtomicU32::new(0),
             give_up: AtomicBool::new(false),
+            turn_active: AtomicBool::new(false),
+            log: Mutex::new(None),
+        }
+    }
+
+    /// Append diagnostics to this file (created or appended).
+    pub(crate) fn set_log(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        *lock(&self.log) = Some(file);
+        Ok(())
+    }
+
+    pub(crate) fn log(&self, line: &str) {
+        if let Some(file) = lock(&self.log).as_mut() {
+            let _ = writeln!(file, "{} {line}", crate::store::now_utc_ms());
+        }
+    }
+
+    /// Mark that a prompt is in flight.
+    pub(crate) fn begin_turn(&self) {
+        self.turn_active.store(true, Ordering::Release);
+    }
+
+    /// Publish a TurnEnd when a prompt is still in flight, so the UI never
+    /// waits forever after a crash, a rejected prompt, a stop or a restart.
+    pub(crate) fn end_turn_if_active(&self, reason: &str) {
+        if self.turn_active.swap(false, Ordering::AcqRel) {
+            self.log(&format!(
+                "event TurnEnd {{ reason: {reason:?} }} (synthesised)"
+            ));
+            self.emit(AgentEvent::TurnEnd {
+                reason: reason.to_owned(),
+            });
+        }
+    }
+
+    /// A new send after "giving up" is an explicit retry: allow it.
+    pub(crate) fn allow_retry(&self) {
+        if self.give_up() {
+            self.reset_failures();
         }
     }
 
@@ -71,6 +124,7 @@ impl Shared {
     }
 
     pub(crate) fn push_stderr(&self, line: String) {
+        self.log(&format!("stderr {line}"));
         let mut lines = lock(&self.stderr);
         if lines.len() >= STDERR_LINES {
             lines.pop_front();
@@ -139,6 +193,7 @@ impl Shared {
                 "{message} (attempt {attempts}/{MAX_RESTARTS}){tail}"
             )));
         }
+        self.end_turn_if_active("error");
         attempts
     }
 
@@ -150,6 +205,7 @@ impl Shared {
         if status.success() {
             self.reset_failures();
             self.set_status(AgentStatus::Stopped);
+            self.end_turn_if_active("error");
             return;
         }
 
@@ -166,6 +222,8 @@ impl Shared {
                 "pi exited unexpectedly ({status}); will restart on the next message (attempt {attempts}/{MAX_RESTARTS}){tail}"
             )));
         }
+        self.log(&format!("exit {status}"));
+        self.end_turn_if_active("error");
     }
 
     /// Apply the status effects of a transcript event, then publish it.
@@ -175,8 +233,17 @@ impl Shared {
         if generation != self.generation.load(Ordering::Acquire) {
             return;
         }
+        if !matches!(event, AgentEvent::TextBreak) {
+            match &event {
+                AgentEvent::TextDelta(text) => self.log(&format!("text {text:?}")),
+                other => self.log(&format!("event {other:?}")),
+            }
+        }
         match &event {
-            AgentEvent::TurnEnd { .. } => self.note_turn_end(),
+            AgentEvent::TurnEnd { .. } => {
+                self.turn_active.store(false, Ordering::Release);
+                self.note_turn_end();
+            }
             AgentEvent::Error(_) if self.status() != AgentStatus::Stopped => {
                 self.set_status(AgentStatus::Error);
             }
@@ -234,6 +301,72 @@ mod tests {
     fn shared() -> Shared {
         let (sender, _receiver) = crossbeam_channel::unbounded();
         Shared::new(sender)
+    }
+
+    fn failed_exit() -> ExitStatus {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            ExitStatus::from_raw(1 << 8)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::ExitStatusExt;
+            ExitStatus::from_raw(1)
+        }
+    }
+
+    #[test]
+    fn a_crash_or_failure_mid_turn_always_ends_the_turn() {
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let shared = Shared::new(sender);
+        let generation = shared.next_generation();
+
+        shared.begin_turn();
+        shared.report_exit(generation, &failed_exit());
+        let events: Vec<AgentEvent> = receiver.try_iter().collect();
+        assert!(matches!(events.first(), Some(AgentEvent::Error(_))));
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::TurnEnd { reason }) if reason == "error"
+        ));
+
+        shared.begin_turn();
+        let _ = shared.note_failure("spawn failed");
+        assert!(
+            receiver
+                .try_iter()
+                .any(|event| matches!(event, AgentEvent::TurnEnd { .. }))
+        );
+
+        shared.end_turn_if_active("aborted");
+        assert_eq!(receiver.try_iter().count(), 0, "no turn, no TurnEnd");
+
+        shared.begin_turn();
+        shared.handle_event(
+            shared.next_generation(),
+            AgentEvent::TurnEnd {
+                reason: "completed".to_owned(),
+            },
+        );
+        shared.end_turn_if_active("aborted");
+        let ends = receiver
+            .try_iter()
+            .filter(|event| matches!(event, AgentEvent::TurnEnd { .. }))
+            .count();
+        assert_eq!(ends, 1, "a real TurnEnd is never doubled");
+    }
+
+    #[test]
+    fn a_retry_after_giving_up_is_allowed() {
+        let shared = shared();
+        for _ in 0..MAX_RESTARTS {
+            let _ = shared.note_failure("boom");
+        }
+        assert!(shared.give_up());
+        shared.allow_retry();
+        assert!(!shared.give_up());
+        assert_eq!(shared.attempts(), 0);
     }
 
     #[test]

@@ -29,6 +29,8 @@ pub struct PiHarness {
 struct Inner {
     profile: PiProfile,
     process: Option<Process>,
+    /// The next spawn starts a fresh session instead of resuming.
+    fresh_session: bool,
 }
 
 impl PiHarness {
@@ -43,6 +45,7 @@ impl PiHarness {
             inner: Mutex::new(Inner {
                 profile,
                 process: None,
+                fresh_session: false,
             }),
             lifecycle: Mutex::new(()),
         }
@@ -69,6 +72,26 @@ impl PiHarness {
         self.shared.status()
     }
 
+    /// Append stderr lines and events to this log file.
+    pub fn set_log(&self, path: &std::path::Path) -> Result<(), AgentError> {
+        self.shared.set_log(path).map_err(AgentError::Io)
+    }
+
+    /// Start a fresh conversation: tell a running Pi, or make the next spawn
+    /// skip `--continue`.
+    pub fn new_session(&self) -> Result<(), AgentError> {
+        let _lifecycle = lock(&self.lifecycle);
+        let record = json!({"id": command_id(), "type": "new_session"});
+        match self.write_running(&record) {
+            Ok(()) => Ok(()),
+            Err(AgentError::NotRunning) => {
+                lock(&self.inner).fresh_session = true;
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Explicitly (re)start Pi with the given profile, resetting failures.
     pub fn start(&self, profile: PiProfile) -> Result<(), AgentError> {
         let _lifecycle = lock(&self.lifecycle);
@@ -78,6 +101,7 @@ impl PiHarness {
     /// Send a prompt. Starts the child lazily and restarts a dead child.
     pub fn send(&self, prompt: &str) -> Result<(), AgentError> {
         let _lifecycle = lock(&self.lifecycle);
+        self.shared.allow_retry();
         self.ensure_running()?;
 
         let id = command_id();
@@ -90,6 +114,7 @@ impl PiHarness {
         // Set Busy before writing: a very fast child could otherwise settle
         // before this method resumes, leaving the harness stuck in Busy.
         self.shared.set_status(AgentStatus::Busy);
+        self.shared.begin_turn();
 
         match self.write_running(&record) {
             Ok(()) => Ok(()),
@@ -148,6 +173,7 @@ impl PiHarness {
             }
             Err(AgentError::NotRunning) => {
                 let _ = self.shared.take_pending(&id);
+                self.shared.end_turn_if_active("aborted");
                 Ok(())
             }
             Err(error) => {
@@ -169,6 +195,7 @@ impl PiHarness {
     }
 
     fn start_locked(&self, profile: PiProfile) -> Result<(), AgentError> {
+        self.shared.end_turn_if_active("aborted");
         self.shared.reset_for_start();
         let previous = {
             let mut inner = lock(&self.inner);
@@ -186,6 +213,7 @@ impl PiHarness {
         if let Some(process) = process {
             process.shutdown(STOP_GRACE);
         }
+        self.shared.end_turn_if_active("aborted");
         self.shared.reset_after_stop();
     }
 
@@ -221,11 +249,18 @@ impl PiHarness {
 
     fn spawn_process(&self) -> Result<(), AgentError> {
         self.shared.set_status(AgentStatus::Starting);
-        let (profile, generation) = {
-            let inner = lock(&self.inner);
-            (inner.profile, self.shared.next_generation())
+        let (profile, generation, fresh) = {
+            let mut inner = lock(&self.inner);
+            let fresh = std::mem::take(&mut inner.fresh_session);
+            (inner.profile, self.shared.next_generation(), fresh)
         };
-        let plan = self.config.launch_plan_for(profile);
+        let mut config = self.config.clone();
+        if config.session_dir.is_some() {
+            config.continue_session = !fresh;
+        }
+        let plan = config.launch_plan_for(profile);
+        self.shared
+            .log(&format!("spawn {} {:?}", plan.program, plan.args));
         self.shared.clear_pending();
 
         match Process::spawn(
@@ -238,6 +273,12 @@ impl PiHarness {
                 lock(&self.inner).process = Some(process);
                 self.shared.set_status(AgentStatus::Ready);
                 self.shared.emit(AgentEvent::Ready);
+                if self.config.session_dir.is_some() {
+                    // Ask for the resumed conversation so the UI can show it.
+                    let id = command_id();
+                    self.shared.register_pending(&id, "get_messages");
+                    let _ = self.write_running(&json!({"id": id, "type": "get_messages"}));
+                }
                 Ok(())
             }
             Err(error) => {
@@ -282,6 +323,10 @@ impl AgentHarness for PiHarness {
 
     fn stop(&self) -> Result<(), AgentError> {
         PiHarness::stop(self)
+    }
+
+    fn new_session(&self) -> Result<(), AgentError> {
+        PiHarness::new_session(self)
     }
 
     fn status(&self) -> AgentStatus {
@@ -404,6 +449,7 @@ mod tests {
         assert_eq!(
             collect_until_turn_end(&events),
             vec![
+                AgentEvent::TextBreak,
                 AgentEvent::TextDelta("Hello".to_owned()),
                 AgentEvent::TextDelta(" world".to_owned()),
                 AgentEvent::TurnEnd {
@@ -418,6 +464,7 @@ mod tests {
         assert_eq!(
             collect_until_turn_end(&events),
             vec![
+                AgentEvent::TextBreak,
                 AgentEvent::TextDelta("Hello".to_owned()),
                 AgentEvent::TextDelta(" world".to_owned()),
                 AgentEvent::TurnEnd {
@@ -444,16 +491,20 @@ mod tests {
             collect_until_turn_end(&events),
             vec![
                 AgentEvent::ToolStart {
+                    id: "c1".to_owned(),
                     name: "mcp__rustboard__add_note".to_owned()
                 },
                 AgentEvent::ToolEnd {
+                    id: "c1".to_owned(),
                     name: "mcp__rustboard__add_note".to_owned(),
                     ok: true
                 },
                 AgentEvent::ToolStart {
+                    id: "c2".to_owned(),
                     name: "mcp__rustboard__board_sql".to_owned()
                 },
                 AgentEvent::ToolEnd {
+                    id: "c2".to_owned(),
                     name: "mcp__rustboard__board_sql".to_owned(),
                     ok: false
                 },
@@ -496,6 +547,7 @@ mod tests {
         assert_eq!(recv(&events), AgentEvent::Ready);
 
         harness.send("count to 100").expect("send");
+        assert_eq!(recv(&events), AgentEvent::TextBreak);
         assert_eq!(recv(&events), AgentEvent::TextDelta("Working".to_owned()));
         assert_eq!(harness.status(), AgentStatus::Busy);
 
