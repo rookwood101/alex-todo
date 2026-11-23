@@ -230,7 +230,11 @@ mod tests {
         assert_eq!(server["args"], json!(["--db", db.to_str().expect("utf8")]));
         let command = server["command"].as_str().expect("command is a string");
         assert!(
-            command.ends_with("rustboard-mcp.exe"),
+            command.ends_with(if cfg!(windows) {
+                "rustboard-mcp.exe"
+            } else {
+                "rustboard-mcp"
+            }),
             "command points at the sibling binary: {command}"
         );
         assert!(

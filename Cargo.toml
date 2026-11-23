@@ -15,10 +15,13 @@ rusqlite = { version = "0.43", features = ["bundled-full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
-tauri-winrt-notification = "0.8"
 thiserror = "2.0"
 tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "io-std"] }
 uuid = { version = "1.0", features = ["v4"] }
+
+
+[target.'cfg(windows)'.dependencies]
+tauri-winrt-notification = "0.8"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
