@@ -770,11 +770,6 @@ fn collapsed_bar(ui: &mut egui::Ui, state: &mut ChatState, output: &mut ChatOutp
             output.mode_toggled = true;
         }
         model_picker(ui, state, output);
-        ui.label(
-            RichText::new("Tab in the composer asks the agent")
-                .size(11.0)
-                .color(theme::TEXT_MUTED),
-        );
     });
 }
 

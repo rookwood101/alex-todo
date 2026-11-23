@@ -30,7 +30,7 @@ use crate::store::{Store, StorePaths, now_utc_ms, schema};
 use crate::theme;
 use crate::ui::board::{BoardContext, BoardOutput, BoardView};
 use crate::ui::chat::{self, ChatOutput, ChatState, ConnectionTurnHistory, TurnHistory};
-use crate::ui::composer::{self, ComposerContext, ComposerState};
+use crate::ui::composer::{self, ComposerContext, ComposerMode, ComposerState};
 use crossbeam_channel::Receiver;
 use eframe::egui::{self, Align, Align2, Color32, Key, Layout, Modifiers, RichText, Ui, vec2};
 
@@ -632,8 +632,10 @@ impl RustboardApp {
         self.canvas_rect = output.canvas_rect;
         self.apply_board_output(output);
 
-        let chat_output = self.show_chat(&ctx);
-        self.handle_chat_output(chat_output);
+        if self.chat_visible() {
+            let chat_output = self.show_chat(&ctx);
+            self.handle_chat_output(chat_output);
+        }
 
         self.composer.set_busy(self.chat.busy);
         let composer_context =
@@ -716,6 +718,12 @@ impl RustboardApp {
             self.view.edit_note(&self.board, id.clone());
             self.view.reveal(id);
         }
+    }
+
+    /// The chat panel (history, model and profile pickers) shows only in
+    /// Agent mode, or while a turn is still running.
+    pub(crate) fn chat_visible(&self) -> bool {
+        self.composer.mode() == ComposerMode::Agent || self.chat.busy
     }
 
     fn show_chat(&mut self, ctx: &egui::Context) -> ChatOutput {
@@ -865,10 +873,12 @@ impl RustboardApp {
                     .size(12.0)
                     .color(theme::TEXT_MUTED),
                 );
-                ui.add_space(10.0);
-                let profile = self.agent_profile_label();
-                ui.label(RichText::new(profile).size(12.0).color(theme::TEXT_MUTED))
-                    .on_hover_text("Pi tool profile for the chat panel");
+                if self.chat_visible() {
+                    ui.add_space(10.0);
+                    let profile = self.agent_profile_label();
+                    ui.label(RichText::new(profile).size(12.0).color(theme::TEXT_MUTED))
+                        .on_hover_text("Pi tool profile for the chat panel");
+                }
             });
         });
     }
