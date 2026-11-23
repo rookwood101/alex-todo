@@ -9,7 +9,7 @@
 //!
 //! * a group is only a whole token that starts with # followed by a name;
 //!   # inside a word (C#) is text;
-//! * a priority is only a whole token: !high, !med, !low or !1..!3;
+//! * importance is only a whole token: !, !important or !high;
 //! * a deadline must sit at the end of the line (after chips are removed),
 //!   optionally introduced by at, by, on or due; "the 4pm thing" is text;
 //! * anything ambiguous (invalid dates, 25:00, unknown words) is left alone.
@@ -20,34 +20,6 @@ use jiff::{Span as DurationSpan, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use crate::time::TimeSpec;
-
-/// Priority carried by a capture line, ordered low to high.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Priority {
-    Low,
-    Medium,
-    High,
-}
-
-impl Priority {
-    /// Numeric form used by the database columns (1 low, 3 high).
-    pub fn as_i64(self) -> i64 {
-        match self {
-            Self::Low => 1,
-            Self::Medium => 2,
-            Self::High => 3,
-        }
-    }
-
-    /// Short human label for chips.
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::High => "high",
-        }
-    }
-}
 
 /// A group name mentioned by the line. Unknown names are proposed, not
 /// created; known is true only when it matched the caller's group list.
@@ -80,8 +52,8 @@ pub struct ParsedCapture {
     pub text: String,
     /// Last group chip, if any.
     pub group: Option<CaptureGroup>,
-    /// Last priority chip, if any.
-    pub priority: Option<Priority>,
+    /// An importance chip ("!" or "!important") was present.
+    pub important: bool,
     /// Deadline, when a date and/or time phrase was consumed.
     pub due: Option<TimeSpec>,
     /// Byte ranges of the original input that were consumed as chips.
@@ -108,7 +80,7 @@ pub fn parse_capture(
 
     let mut consumed = vec![false; tokens.len()];
     let mut group: Option<CaptureGroup> = None;
-    let mut priority: Option<Priority> = None;
+    let mut important = false;
 
     for (index, token) in tokens.iter().enumerate() {
         if let Some(name) = group_name(token.text) {
@@ -117,8 +89,8 @@ pub fn parse_capture(
                 name: name.to_owned(),
             });
             consumed[index] = true;
-        } else if let Some(value) = priority_of(token.text) {
-            priority = Some(value);
+        } else if is_importance(token.text) {
+            important = true;
             consumed[index] = true;
         }
     }
@@ -159,7 +131,7 @@ pub fn parse_capture(
     ParsedCapture {
         text: parts.join(" "),
         group,
-        priority,
+        important,
         due,
         consumed: spans,
     }
@@ -211,13 +183,12 @@ fn group_name(token: &str) -> Option<&str> {
     Some(name)
 }
 
-fn priority_of(token: &str) -> Option<Priority> {
-    match token.to_ascii_lowercase().as_str() {
-        "!high" | "!3" => Some(Priority::High),
-        "!med" | "!medium" | "!2" => Some(Priority::Medium),
-        "!low" | "!1" => Some(Priority::Low),
-        _ => None,
-    }
+/// A whole "!" token, or the long forms "!important" / "!high".
+fn is_importance(token: &str) -> bool {
+    matches!(
+        token.to_ascii_lowercase().as_str(),
+        "!" | "!important" | "!high"
+    )
 }
 
 /// Today's civil date in the given zone, or None when the zone is invalid.
@@ -661,7 +632,7 @@ mod tests {
         let parsed = parse("buy milk, eggs and bread!");
         assert_eq!(parsed.text, "buy milk, eggs and bread!");
         assert!(parsed.group.is_none());
-        assert!(parsed.priority.is_none());
+        assert!(!parsed.important);
         assert!(parsed.due.is_none());
         assert!(parsed.consumed.is_empty());
     }
@@ -691,22 +662,21 @@ mod tests {
     }
 
     #[test]
-    fn priorities_are_whole_tokens() {
-        let cases = [
-            ("!high write it", "write it", Priority::High),
-            ("!med write it", "write it", Priority::Medium),
-            ("!low write it", "write it", Priority::Low),
-            ("!3 write it", "write it", Priority::High),
-            ("!2 write it", "write it", Priority::Medium),
-            ("!1 write it", "write it", Priority::Low),
-        ];
-        for (input, text, expected) in cases {
+    fn importance_is_a_whole_bang_token() {
+        for input in [
+            "! write it",
+            "write it !",
+            "!important write it",
+            "!HIGH write it",
+        ] {
             let parsed = parse(input);
-            assert_eq!(parsed.text, text, "input: {input}");
-            assert_eq!(parsed.priority, Some(expected), "input: {input}");
+            assert_eq!(parsed.text, "write it", "input: {input}");
+            assert!(parsed.important, "input: {input}");
         }
-        assert!(parse("!urgent write it").priority.is_none());
+        assert!(!parse("!urgent write it").important);
+        assert!(!parse("!low write it").important);
         assert_eq!(parse("write!").text, "write!");
+        assert!(!parse("write!").important);
     }
 
     #[test]
@@ -818,7 +788,7 @@ mod tests {
         let parsed = parse("#home !high buy milk tomorrow at 4pm");
         assert_eq!(parsed.text, "buy milk");
         assert_eq!(parsed.group.as_ref().expect("group").name, "home");
-        assert_eq!(parsed.priority, Some(Priority::High));
+        assert!(parsed.important);
         assert_eq!(due_local(&parsed), "2026-11-23T16:00:00");
 
         let input = "#home !high buy milk tomorrow at 4pm";

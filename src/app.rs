@@ -87,6 +87,20 @@ impl TurnHistory for NoTurnHistory {
     }
 }
 
+/// Titles of root containers (and the Inbox), offered to `#` capture tags.
+fn container_names(board: &Board) -> Vec<String> {
+    let mut names: Vec<String> = board
+        .notes
+        .iter()
+        .filter(|note| note.parent.is_none() && (note.inbox || board.has_children(&note.id)))
+        .map(|note| note.text.lines().next().unwrap_or("").trim().to_owned())
+        .filter(|name| !name.is_empty())
+        .collect();
+    names.sort_by_key(|name| name.to_lowercase());
+    names.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    names
+}
+
 /// The application.
 pub struct RustboardApp {
     pub(crate) paths: StorePaths,
@@ -244,11 +258,7 @@ impl RustboardApp {
         };
         match Board::load(store.connection()) {
             Ok(board) => {
-                self.group_names = board
-                    .groups
-                    .iter()
-                    .map(|group| group.name.clone())
-                    .collect();
+                self.group_names = container_names(&board);
                 self.board = board;
                 self.view.after_reload(&self.board);
                 self.data_version = store.data_version().unwrap_or(self.data_version);
@@ -332,11 +342,12 @@ impl RustboardApp {
         let applied = self.apply_commands(
             vec![Command::AddNote {
                 text: String::new(),
-                group: None,
                 parent: None,
+                container: None,
+                at_root: false,
                 due: None,
                 remind: None,
-                priority: None,
+                important: false,
                 source: "human".to_owned(),
             }],
             "new note",

@@ -62,6 +62,9 @@ pub enum ToolError {
     #[error(transparent)]
     History(#[from] HistoryError),
 
+    #[error(transparent)]
+    Model(#[from] crate::model::ModelError),
+
     #[error("SQLite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
 
@@ -141,6 +144,23 @@ pub struct BoardSqlResult {
     pub checks: Vec<String>,
 }
 
+/// Arguments for board_find_container.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct BoardFindContainerArgs {
+    /// Container path such as "Work" or "work/q4". Matching is
+    /// case-insensitive and reads "-"/"_" as spaces.
+    pub name: String,
+}
+
+/// The result of board_find_container.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoardFindContainerResult {
+    /// The matching note id, or null when no container matches.
+    pub id: Option<String>,
+    /// The Inbox id, if the board has one.
+    pub inbox_id: Option<String>,
+}
+
 /// Arguments for board_history.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct BoardHistoryArgs {
@@ -187,20 +207,19 @@ impl JsonSchema for Command {
 
     fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
         let note_id = || json!({"type": "string", "description": "Note id"});
-        let group = || json!({"type": ["string", "null"], "description": "Group name; null moves the note to the Inbox"});
         let parent = || json!({"type": ["string", "null"], "description": "Parent note id; null makes the note a root"});
         let time = time_spec_schema;
-        let priority = || json!({"type": ["string", "null"], "enum": ["low", "med", "high", null]});
         let mut one_of = Vec::new();
         one_of.push(command_variant(
             "add_note",
             &[
                 ("text", json!({"type": "string"})),
-                ("group", group()),
-                ("parent", parent()),
+                ("parent", json!({"type": ["string", "null"], "description": "Existing parent note id"})),
+                ("container", json!({"type": ["string", "null"], "description": "Container path such as \"Work\" or \"work/q4\"; matched case-insensitively (\"-\"/\"_\" read as spaces) and created when missing"})),
+                ("at_root", json!({"type": "boolean", "description": "Place at the root; without parent, container or at_root the note goes to the Inbox"})),
                 ("due", time()),
                 ("remind", time()),
-                ("priority", priority()),
+                ("important", json!({"type": "boolean"})),
                 ("source", json!({"type": "string"})),
             ],
             &["text"],
@@ -211,19 +230,18 @@ impl JsonSchema for Command {
             &["id", "text"],
         ));
         one_of.push(command_variant(
-            "set_group",
-            &[("id", note_id()), ("group", group())],
-            &["id"],
-        ));
-        one_of.push(command_variant(
             "set_parent",
-            &[("id", note_id()), ("parent", parent())],
+            &[
+                ("id", note_id()),
+                ("parent", parent()),
+                ("before", json!({"type": ["string", "null"], "description": "Sibling id to insert before; null appends"})),
+            ],
             &["id"],
         ));
         one_of.push(command_variant(
-            "set_priority",
-            &[("id", note_id()), ("priority", priority())],
-            &["id"],
+            "set_important",
+            &[("id", note_id()), ("important", json!({"type": "boolean"}))],
+            &["id", "important"],
         ));
         one_of.push(command_variant(
             "set_due",
@@ -253,22 +271,6 @@ impl JsonSchema for Command {
                 ("y", json!({"type": "number"})),
             ],
             &["id", "x", "y"],
-        ));
-        one_of.push(command_variant(
-            "create_group",
-            &[
-                ("name", json!({"type": "string"})),
-                ("color", json!({"type": "integer"})),
-            ],
-            &["name"],
-        ));
-        one_of.push(command_variant(
-            "rename_group",
-            &[
-                ("id", json!({"type": "string", "description": "Group id"})),
-                ("name", json!({"type": "string"})),
-            ],
-            &["id", "name"],
         ));
         one_of.push(command_variant(
             "link",
@@ -483,6 +485,80 @@ pub fn board_sql(paths: &StorePaths, args: BoardSqlArgs) -> Result<BoardSqlResul
 }
 
 /// Read a note's events, or a batch range, on a read-only connection.
+pub fn board_find_container(
+    paths: &StorePaths,
+    args: BoardFindContainerArgs,
+) -> Result<BoardFindContainerResult, ToolError> {
+    ensure_database(paths)?;
+    let store = Store::open_read_only(paths.db())?;
+    let conn = store.connection();
+    let inbox_id = crate::model::find_inbox(conn)?;
+    let mut parent: Option<String> = None;
+    let mut found = None;
+    for segment in args
+        .name
+        .split('/')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        found = crate::model::find_child_by_name(conn, parent.as_deref(), segment)?;
+        match &found {
+            Some(id) => parent = Some(id.clone()),
+            None => break,
+        }
+    }
+    Ok(BoardFindContainerResult {
+        id: found,
+        inbox_id,
+    })
+}
+
+#[cfg(test)]
+mod find_container_tests {
+    use super::*;
+    use crate::command::{Actor, Command};
+    use crate::store::{schema, scratch_dir};
+
+    #[test]
+    fn find_container_walks_a_name_path() {
+        let paths = StorePaths::from_home(scratch_dir("mcp-find-container"));
+        let mut store = schema::open_board(&paths).expect("board opens");
+        store
+            .apply(
+                &[Command::AddNote {
+                    text: "plan".to_owned(),
+                    parent: None,
+                    container: Some("Work/Q4".to_owned()),
+                    at_root: false,
+                    due: None,
+                    remind: None,
+                    important: false,
+                    source: "test".to_owned(),
+                }],
+                Actor::Human,
+                None,
+            )
+            .expect("add");
+        drop(store);
+        let found = board_find_container(
+            &paths,
+            BoardFindContainerArgs {
+                name: "work/q4".to_owned(),
+            },
+        )
+        .expect("find");
+        assert!(found.id.is_some());
+        let missing = board_find_container(
+            &paths,
+            BoardFindContainerArgs {
+                name: "home".to_owned(),
+            },
+        )
+        .expect("find");
+        assert!(missing.id.is_none());
+    }
+}
+
 pub fn board_history(
     paths: &StorePaths,
     args: BoardHistoryArgs,
@@ -714,11 +790,12 @@ mod tests {
             .apply(
                 &[Command::AddNote {
                     text: text.to_owned(),
-                    group: None,
+                    container: None,
+                    at_root: true,
                     parent: None,
                     due: None,
                     remind: None,
-                    priority: None,
+                    important: false,
                     source: "test".to_owned(),
                 }],
                 Actor::Human,
@@ -855,11 +932,12 @@ mod tests {
             BoardApplyArgs {
                 commands: vec![Command::AddNote {
                     text: "from mcp".to_owned(),
-                    group: None,
+                    container: None,
+                    at_root: true,
                     parent: None,
                     due: None,
                     remind: None,
-                    priority: None,
+                    important: false,
                     source: "mcp-test".to_owned(),
                 }],
                 description: Some("mcp apply".to_owned()),
@@ -1116,11 +1194,12 @@ mod tests {
             BoardApplyArgs {
                 commands: vec![Command::AddNote {
                     text: "history".to_owned(),
-                    group: None,
+                    container: None,
+                    at_root: true,
                     parent: None,
                     due: None,
                     remind: None,
-                    priority: None,
+                    important: false,
                     source: "mcp-test".to_owned(),
                 }],
                 description: Some("add through mcp".to_owned()),

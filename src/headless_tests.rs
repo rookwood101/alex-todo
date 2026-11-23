@@ -132,6 +132,27 @@ impl Headless {
             .expect("note is on screen")
     }
 
+    /// A canvas point outside `avoid` that no floating panel covers.
+    fn empty_point(&self, avoid: Rect) -> Pos2 {
+        let canvas = self.app.canvas_rect;
+        let candidates = [
+            pos2(avoid.min.x - 60.0, avoid.center().y),
+            pos2(avoid.center().x, avoid.min.y - 40.0),
+            pos2(avoid.max.x + 60.0, avoid.center().y),
+            pos2(avoid.center().x, avoid.max.y + 40.0),
+        ];
+        candidates
+            .into_iter()
+            .find(|point| {
+                canvas.contains(*point)
+                    && self
+                        .ctx
+                        .layer_id_at(*point)
+                        .is_none_or(|layer| layer.order == eframe::egui::Order::Background)
+            })
+            .expect("an empty canvas point")
+    }
+
     fn note_ids(&self) -> Vec<String> {
         self.app
             .board
@@ -146,11 +167,12 @@ fn add_note(app: &mut RustboardApp, text: &str) {
     app.apply_commands(
         vec![Command::AddNote {
             text: text.to_owned(),
-            group: None,
+            container: None,
+            at_root: true,
             parent: None,
             due: None,
             remind: None,
-            priority: None,
+            important: false,
             source: "test".to_owned(),
         }],
         "test",
@@ -164,11 +186,12 @@ fn external_add(paths: &StorePaths, text: &str) {
         .apply(
             &[Command::AddNote {
                 text: text.to_owned(),
-                group: None,
+                container: None,
+                at_root: true,
                 parent: None,
                 due: None,
                 remind: None,
-                priority: None,
+                important: false,
                 source: "agent".to_owned(),
             }],
             Actor::Agent,
@@ -186,19 +209,32 @@ fn capture_through_the_composer_creates_a_db_row() {
     headless.key(Key::Enter);
     headless.run_frame(Vec::new());
 
-    assert_eq!(
-        headless.app.board.notes.len(),
-        1,
-        "composer Enter creates one note"
-    );
-    let note = &headless.app.board.notes[0];
+    let inbox = headless
+        .app
+        .board
+        .inbox()
+        .expect("capture creates the Inbox")
+        .clone();
+    let notes: Vec<_> = headless
+        .app
+        .board
+        .notes
+        .iter()
+        .filter(|note| !note.inbox)
+        .collect();
+    assert_eq!(notes.len(), 1, "composer Enter creates one note");
+    let note = notes[0];
     assert_eq!(note.text, "buy milk");
+    assert_eq!(
+        note.parent.as_ref(),
+        Some(&inbox.id),
+        "it lands in the Inbox"
+    );
     assert!(note.due.is_some(), "capture chips were applied");
 
     let stored = Board::load(headless.app.store.as_ref().expect("store").connection())
         .expect("stored board");
-    assert_eq!(stored.notes.len(), 1);
-    assert_eq!(stored.notes[0].text, "buy milk");
+    assert_eq!(stored.notes.len(), 2, "the note and the Inbox");
 }
 
 #[test]
@@ -389,7 +425,7 @@ fn a_box_drag_and_shift_click_build_a_multi_selection() {
     headless.click_with(first.center(), Modifiers::SHIFT);
     assert_eq!(headless.app.view.selected, vec![ids[1].clone()]);
 
-    let empty = pos2(all.max.x + 150.0, all.center().y);
+    let empty = headless.empty_point(all);
     headless.click(empty);
     assert!(headless.app.view.selected.is_empty(), "empty canvas clears");
 }

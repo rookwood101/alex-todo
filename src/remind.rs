@@ -135,7 +135,7 @@ impl ReminderCore {
                     note.text.clone()
                 },
                 tag: note.id.clone(),
-                urgent: note.priority == Some(crate::model::Priority::High),
+                urgent: note.important,
             });
         }
 
@@ -340,14 +340,15 @@ mod tests {
             .apply(
                 &[Command::AddNote {
                     text: text.to_owned(),
-                    group: None,
+                    container: None,
+                    at_root: true,
                     parent: None,
                     due: None,
                     remind: Some(TimeSpec {
                         local: remind_local.to_owned(),
                         tz: "Europe/London".to_owned(),
                     }),
-                    priority: None,
+                    important: false,
                     source: "test".to_owned(),
                 }],
                 Actor::Human,

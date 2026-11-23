@@ -63,6 +63,10 @@ pub fn migrations() -> Migrations {
             "0002_fts.sql",
             include_str!("../../migrations/0002_fts.sql"),
         ),
+        (
+            "0003_containers.sql",
+            include_str!("../../migrations/0003_containers.sql"),
+        ),
     ])
     .expect("embedded migrations have valid names and unique versions")
 }
@@ -257,7 +261,7 @@ mod tests {
             .expect("query history")
             .collect::<rusqlite::Result<Vec<_>>>()
             .expect("read history");
-        assert_eq!(versions, vec![1, 2]);
+        assert_eq!(versions, vec![1, 2, 3]);
 
         // The FTS table was created by 0002 (FTS5 is compiled in bundled-full).
         let fts_sql: String = conn
@@ -276,7 +280,7 @@ mod tests {
         let on_disk = Migrations::from_dir(&dir).expect("migrations folder reads");
         let embedded = migrations();
 
-        assert_eq!(embedded.latest_version(), 2);
+        assert_eq!(embedded.latest_version(), 3);
         assert_eq!(on_disk.len(), embedded.len());
         for (disk, built) in on_disk.migrations().iter().zip(embedded.migrations()) {
             assert_eq!(disk.version, built.version);
@@ -338,6 +342,74 @@ mod tests {
         assert_eq!(
             found,
             vec![("n1".to_owned(), "pre-existing text".to_owned())]
+        );
+    }
+
+    #[test]
+    fn containers_migration_turns_groups_into_notes_and_fills_the_inbox() {
+        let dir = scratch_dir("schema-containers");
+        let db = dir.join("board.sqlite3");
+        let backups = dir.join("backups");
+        let mut store = Store::open(&db).expect("open board database");
+        let v2 = Migrations::from_sql(&[
+            (
+                "0001_init.sql",
+                include_str!("../../migrations/0001_init.sql"),
+            ),
+            (
+                "0002_fts.sql",
+                include_str!("../../migrations/0002_fts.sql"),
+            ),
+        ])
+        .expect("v2 parses");
+        store.migrate(&v2, &backups).expect("v2 applies");
+        let conn = store.connection();
+        conn.execute_batch(
+            "INSERT INTO groups (id, name, sort_order, created_at_utc_ms, updated_at_utc_ms)
+                 VALUES ('g-home', 'Home', 0, 1, 1);
+             INSERT INTO notes (id, text, group_id, priority, created_at_utc_ms, updated_at_utc_ms)
+                 VALUES ('grouped', 'milk', 'g-home', 'high', 1, 1);
+             INSERT INTO notes (id, text, priority, created_at_utc_ms, updated_at_utc_ms)
+                 VALUES ('loose', 'call', 'low', 1, 1);
+             INSERT INTO notes (id, text, layout_mode, pos_x, pos_y,
+                                created_at_utc_ms, updated_at_utc_ms)
+                 VALUES ('pinned', 'pin', 'pinned', 5.0, 6.0, 1, 1);
+             INSERT INTO notes (id, text, created_at_utc_ms, updated_at_utc_ms)
+                 VALUES ('box', 'project', 1, 1);
+             INSERT INTO notes (id, text, parent_id, created_at_utc_ms, updated_at_utc_ms)
+                 VALUES ('kid', 'step', 'box', 1, 1);",
+        )
+        .expect("seed a v2 board");
+
+        let report = store
+            .migrate(&migrations(), &backups)
+            .expect("0003 applies");
+        assert!(
+            report.backup.is_some(),
+            "an existing board is backed up first"
+        );
+        let board = crate::model::Board::load(store.connection()).expect("load");
+        let note = |id: &str| board.note(id).expect(id).clone();
+
+        let home = note("g-home");
+        assert_eq!(home.text, "Home");
+        assert_eq!(home.parent, None);
+        assert_eq!(note("grouped").parent.as_deref(), Some("g-home"));
+        assert!(note("grouped").important, "high priority becomes important");
+        assert!(!note("loose").important);
+
+        let inbox = board.inbox().expect("loose notes need an Inbox").clone();
+        assert_eq!(note("loose").parent.as_ref(), Some(&inbox.id));
+        assert_eq!(note("pinned").parent, None, "pinned notes stay at the root");
+        assert_eq!(note("box").parent, None, "user containers stay at the root");
+        assert_eq!(note("kid").parent.as_deref(), Some("box"));
+        assert!(
+            board
+                .notes
+                .iter()
+                .filter(|n| n.parent.is_none())
+                .all(|n| n.id != "loose"),
+            "loose notes leave the root"
         );
     }
 

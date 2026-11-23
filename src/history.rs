@@ -194,10 +194,12 @@ pub struct BatchSummary {
 }
 
 /// The canonical board image used by [capture_board] and [restore_snapshot]:
-/// the active notes, groups and edges, sorted by id.
+/// the active notes and edges, sorted by id. `groups` is legacy: new images
+/// leave it empty, and old images still restore their group rows.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct BoardImage {
     pub notes: Vec<Note>,
+    #[serde(default)]
     pub groups: Vec<Group>,
     pub edges: Vec<Edge>,
 }
@@ -208,7 +210,7 @@ impl BoardImage {
         let board = model::Board::load(conn)?;
         Ok(Self {
             notes: board.notes,
-            groups: board.groups,
+            groups: Vec::new(),
             edges: board.edges,
         }
         .sorted())
@@ -1035,14 +1037,14 @@ fn write_row(conn: &Connection, image: &RowImage, mode: WriteMode) -> Result<(),
 
 const NOTE_UPDATE_SQL: &str = "UPDATE notes SET
         text = :text,
-        group_id = :group_id,
+        role = :role,
         parent_id = :parent_id,
         layout_mode = :layout_mode,
         pos_x = :pos_x,
         pos_y = :pos_y,
         sort_order = :sort_order,
         color = :color,
-        priority = :priority,
+        important = :important,
         status = :status,
         source = :source,
         created_at_utc_ms = :created_at,
@@ -1062,14 +1064,14 @@ const NOTE_UPDATE_SQL: &str = "UPDATE notes SET
 
 const NOTE_REPLACE_SQL: &str = "UPDATE notes SET
         text = :text,
-        group_id = :group_id,
+        role = :role,
         parent_id = :parent_id,
         layout_mode = :layout_mode,
         pos_x = :pos_x,
         pos_y = :pos_y,
         sort_order = :sort_order,
         color = :color,
-        priority = :priority,
+        important = :important,
         status = :status,
         source = :source,
         created_at_utc_ms = :created_at,
@@ -1090,14 +1092,14 @@ const NOTE_REPLACE_SQL: &str = "UPDATE notes SET
     WHERE id = :id";
 
 const NOTE_INSERT_SQL: &str = "INSERT INTO notes
-        (id, text, group_id, parent_id, layout_mode, pos_x, pos_y, sort_order,
-         color, priority, status, source, created_at_utc_ms, updated_at_utc_ms,
+        (id, text, role, parent_id, layout_mode, pos_x, pos_y, sort_order,
+         color, important, status, source, created_at_utc_ms, updated_at_utc_ms,
          deleted_at_utc_ms, version, due_local, due_tz, due_utc_ms, remind_local,
          remind_tz, remind_utc_ms, reminded_at_utc_ms, snooze_local, snooze_tz,
          snooze_utc_ms, completed_at_utc_ms)
     VALUES
-        (:id, :text, :group_id, :parent_id, :layout_mode, :pos_x, :pos_y, :sort_order,
-         :color, :priority, :status, :source, :created_at, :updated_at,
+        (:id, :text, :role, :parent_id, :layout_mode, :pos_x, :pos_y, :sort_order,
+         :color, :important, :status, :source, :created_at, :updated_at,
          :deleted_at, :version, :due_local, :due_tz, :due_utc_ms, :remind_local,
          :remind_tz, :remind_utc_ms, :reminded_at, :snooze_local, :snooze_tz,
          :snooze_utc_ms, :completed_at)";
@@ -1107,21 +1109,22 @@ fn write_note(conn: &Connection, note: &Note, mode: WriteMode) -> Result<(), His
     let (remind_local, remind_tz, remind_utc_ms) = time_columns(note.remind.as_ref())?;
     let (snooze_local, snooze_tz, snooze_utc_ms) = time_columns(note.snooze.as_ref())?;
     let (pos_x, pos_y) = position(note);
-    let priority = note.priority.map(|priority| priority.as_str());
+    let role = note.inbox.then_some("inbox");
+    let important = i64::from(note.important);
     let layout_mode = note.layout.as_str();
     let status = note.status.as_str();
 
     let mut values: Vec<(&'static str, &dyn ToSql)> = vec![
         (":id", &note.id),
         (":text", &note.text),
-        (":group_id", &note.group),
+        (":role", &role),
         (":parent_id", &note.parent),
         (":layout_mode", &layout_mode),
         (":pos_x", &pos_x),
         (":pos_y", &pos_y),
         (":sort_order", &note.sort),
         (":color", &note.color),
-        (":priority", &priority),
+        (":important", &important),
         (":status", &status),
         (":source", &note.source),
         (":created_at", &note.created_at_utc_ms),
@@ -1730,7 +1733,6 @@ fn new_id() -> String {
 mod tests {
     use super::*;
     use crate::command::{Command, audit_counts};
-    use crate::model::Priority;
     use crate::store::{StorePaths, schema, scratch_dir};
 
     fn store(name: &str) -> Store {
@@ -1741,11 +1743,12 @@ mod tests {
     fn add_note(text: &str) -> Command {
         Command::AddNote {
             text: text.to_owned(),
-            group: None,
+            container: None,
+            at_root: true,
             parent: None,
             due: None,
             remind: None,
-            priority: None,
+            important: false,
             source: "test".to_owned(),
         }
     }
@@ -1757,10 +1760,11 @@ mod tests {
         }
     }
 
-    fn set_priority(id: &str, priority: Priority) -> Command {
-        Command::SetPriority {
+    /// Mark a note important (the old priority tests now flip this flag).
+    fn set_important(id: &str) -> Command {
+        Command::SetImportant {
             id: id.to_owned(),
-            priority: Some(priority),
+            important: true,
         }
     }
 
@@ -1794,10 +1798,6 @@ mod tests {
         for note in &mut board.notes {
             note.version = 0;
             note.updated_at_utc_ms = 0;
-        }
-        for group in &mut board.groups {
-            group.version = 0;
-            group.updated_at_utc_ms = 0;
         }
         for edge in &mut board.edges {
             edge.version = 0;
@@ -1874,11 +1874,12 @@ mod tests {
             .apply(
                 &[Command::AddNote {
                     text: "buy milk".to_owned(),
-                    group: Some("Home".to_owned()),
+                    container: Some("Home".to_owned()),
+                    at_root: false,
                     parent: None,
                     due: None,
                     remind: None,
-                    priority: None,
+                    important: false,
                     source: "test".to_owned(),
                 }],
                 Actor::Human,
@@ -1886,23 +1887,23 @@ mod tests {
             )
             .expect("add");
         let note_id = applied.new_ids.notes[0].clone();
-        let group_id = applied.new_ids.groups[0].clone();
+        let container_id = note(&store, &note_id)
+            .expect("note")
+            .parent
+            .expect("the note sits in the new container");
 
         let outcome = undo_last(&mut store).expect("undo");
         assert_eq!(outcome.kind, BatchKind::Undo);
         assert_eq!(outcome.targets, vec![applied.batch_id.clone()]);
-        assert_eq!(outcome.events, 2, "the note and the group it created");
+        assert_eq!(outcome.events, 2, "the note and the container it created");
         assert_eq!(outcome.skipped, 0);
 
         assert!(visible_board(&store).notes.is_empty());
-        assert!(visible_board(&store).groups.is_empty());
         let row = note(&store, &note_id).expect("the row is kept");
         assert!(row.deleted_at_utc_ms.is_some());
         assert!(row.version > 1, "the triggers bumped the version");
-        let group = model::load_group(store.connection(), &group_id)
-            .expect("read group")
-            .expect("group row is kept");
-        assert!(group.deleted_at_utc_ms.is_some());
+        let container = note(&store, &container_id).expect("container row is kept");
+        assert!(container.deleted_at_utc_ms.is_some());
 
         assert_eq!(
             undone_apply_batches(store.connection()).expect("undone"),
@@ -1940,11 +1941,12 @@ mod tests {
             .apply(
                 &[Command::AddNote {
                     text: "child".to_owned(),
-                    group: None,
+                    container: None,
+                    at_root: true,
                     parent: Some(parent.clone()),
                     due: None,
                     remind: None,
-                    priority: None,
+                    important: false,
                     source: "test".to_owned(),
                 }],
                 Actor::Human,
@@ -2024,6 +2026,7 @@ mod tests {
             &[Command::SetParent {
                 id: id.clone(),
                 parent: Some(parent.clone()),
+                before: None,
             }],
         );
         assert_eq!(
@@ -2141,17 +2144,14 @@ mod tests {
         let (_, id) = add(&mut store, "v0");
         let (_, other) = add(&mut store, "other");
         let first = apply(&mut store, &[set_text(&id, "v1")]);
-        let second = apply(
-            &mut store,
-            &[set_text(&id, "v2"), set_priority(&other, Priority::High)],
-        );
+        let second = apply(&mut store, &[set_text(&id, "v2"), set_important(&other)]);
 
         let outcome =
             undo_batches(&mut store, &[first.clone(), second.clone()]).expect("undo range");
         assert_eq!(outcome.targets, vec![first.clone(), second.clone()]);
         assert_eq!(outcome.events, 3, "two text events and the priority event");
         assert_eq!(note(&store, &id).expect("note").text, "v0");
-        assert_eq!(note(&store, &other).expect("other").priority, None);
+        assert!(!note(&store, &other).expect("other").important);
         assert!(
             undone_apply_batches(store.connection())
                 .expect("undone")
@@ -2161,10 +2161,7 @@ mod tests {
         // Redo the range: both batches are re-applied oldest first.
         redo_last(&mut store).expect("redo range");
         assert_eq!(note(&store, &id).expect("note").text, "v2");
-        assert_eq!(
-            note(&store, &other).expect("other").priority,
-            Some(Priority::High)
-        );
+        assert!(note(&store, &other).expect("other").important);
     }
 
     #[test]
@@ -2176,7 +2173,7 @@ mod tests {
             &mut store,
             &[
                 set_text(&id, "new"),
-                set_priority(&id, Priority::High),
+                set_important(&id),
                 Command::Complete { id: id.clone() },
             ],
         );
@@ -2185,7 +2182,7 @@ mod tests {
         assert_eq!(outcome.events, 3);
         let after = note(&store, &id).expect("note");
         assert_eq!(after.text, "text");
-        assert_eq!(after.priority, None);
+        assert!(!after.important);
         assert_eq!(after.status, model::Status::Open);
         assert!(after.completed_at_utc_ms.is_none());
         assert!(after.version > before.version);
@@ -2217,16 +2214,13 @@ mod tests {
         let (_, id) = add(&mut store, "first");
         apply(&mut store, &[set_text(&id, "second")]);
         undo_last(&mut store).expect("undo");
-        apply(&mut store, &[set_priority(&id, Priority::Low)]);
+        apply(&mut store, &[set_important(&id)]);
         let before = counts(&store);
 
         let error = redo_last(&mut store).expect_err("conflict");
         assert!(matches!(error, HistoryError::Conflict { .. }));
         assert_eq!(note(&store, &id).expect("note").text, "first");
-        assert_eq!(
-            note(&store, &id).expect("note").priority,
-            Some(Priority::Low)
-        );
+        assert!(note(&store, &id).expect("note").important);
         assert_eq!(counts(&store), before);
     }
 
@@ -2251,11 +2245,7 @@ mod tests {
     fn undo_skips_system_batches() {
         let mut store = store("history-system");
         let (_, first) = add(&mut store, "first");
-        let system_batch = apply_as(
-            &mut store,
-            Actor::System,
-            &[set_priority(&first, Priority::High)],
-        );
+        let system_batch = apply_as(&mut store, Actor::System, &[set_important(&first)]);
         assert_eq!(batch_kind(&store, &system_batch), BatchKind::Apply);
         let (human_batch, newest) = add(&mut store, "newest");
 
@@ -2273,9 +2263,8 @@ mod tests {
             "the human add was undone"
         );
         assert!(note(&store, &first).expect("note").is_active());
-        assert_eq!(
-            note(&store, &first).expect("note").priority,
-            Some(Priority::High),
+        assert!(
+            note(&store, &first).expect("note").important,
             "the system change is left alone"
         );
         assert!(
@@ -2306,11 +2295,7 @@ mod tests {
         let (_, b) = add(&mut store, "b");
         let text_a = apply(&mut store, &[set_text(&a, "a2")]);
         undo_last(&mut store).expect("undo a2");
-        let system = apply_as(
-            &mut store,
-            Actor::System,
-            &[set_priority(&b, Priority::Low)],
-        );
+        let system = apply_as(&mut store, Actor::System, &[set_important(&b)]);
         let (_, c) = add(&mut store, "c");
         let text_c = apply(&mut store, &[set_text(&c, "c2")]);
 
@@ -2496,27 +2481,18 @@ mod tests {
         let mut store = store("history-snapshot");
         let (_, keep) = add(&mut store, "keep me");
         let (_, dropped) = add(&mut store, "drop me");
+        let (_, home) = add(&mut store, "Home");
         store
             .apply(
-                &[Command::CreateGroup {
-                    name: "Home".to_owned(),
-                    color: 1,
-                }],
-                Actor::Human,
-                None,
-            )
-            .expect("group");
-        let home = visible_board(&store).groups[0].id.clone();
-        store
-            .apply(
-                &[Command::SetGroup {
+                &[Command::SetParent {
                     id: keep.clone(),
-                    group: Some("Home".to_owned()),
+                    parent: Some(home.clone()),
+                    before: None,
                 }],
                 Actor::Human,
                 None,
             )
-            .expect("set group");
+            .expect("nest");
         let link = store
             .apply(
                 &[Command::Link {
@@ -2548,19 +2524,7 @@ mod tests {
                 id: dropped.clone(),
             }],
         );
-        let later = store
-            .apply(
-                &[Command::CreateGroup {
-                    name: "Later".to_owned(),
-                    color: 0,
-                }],
-                Actor::Human,
-                None,
-            )
-            .expect("later group")
-            .new_ids
-            .groups[0]
-            .clone();
+        let (_, later) = add(&mut store, "Later");
         assert_ne!(
             board_revision(store.connection()).expect("revision"),
             revision
@@ -2578,13 +2542,14 @@ mod tests {
             revision
         );
         assert_eq!(note(&store, &keep).expect("keep").text, "keep me");
-        assert_eq!(note(&store, &keep).expect("keep").group, Some(home.clone()));
+        assert_eq!(
+            note(&store, &keep).expect("keep").parent,
+            Some(home.clone())
+        );
         assert!(note(&store, &dropped).expect("dropped").is_active());
         assert!(visible_board(&store).edge(&edge).is_some());
         assert!(
-            model::load_group(store.connection(), &later)
-                .expect("read group")
-                .is_none(),
+            note(&store, &later).is_none(),
             "rows outside the snapshot are hard-deleted"
         );
         assert_eq!(
@@ -2719,14 +2684,15 @@ mod tests {
             .apply(
                 &[Command::AddNote {
                     text: "task".to_owned(),
-                    group: Some("Home".to_owned()),
+                    container: Some("Home".to_owned()),
+                    at_root: false,
                     parent: None,
                     due: Some(TimeSpec {
                         local: "2026-12-01T09:00:00".to_owned(),
                         tz: "Europe/London".to_owned(),
                     }),
                     remind: None,
-                    priority: Some(Priority::High),
+                    important: true,
                     source: "capture".to_owned(),
                 }],
                 Actor::Human,
@@ -2749,6 +2715,7 @@ mod tests {
             Command::SetParent {
                 id: id.clone(),
                 parent: Some(parent.clone()),
+                before: None,
             },
             Command::Pin {
                 id: parent.clone(),
@@ -2845,30 +2812,29 @@ mod tests {
     fn a_snapshot_that_breaks_foreign_keys_rolls_back() {
         let mut store = store("history-snapshot-fk");
         let (_, id) = add(&mut store, "task");
+        let (_, home) = add(&mut store, "Home");
         store
             .apply(
-                &[Command::CreateGroup {
-                    name: "Home".to_owned(),
-                    color: 0,
-                }],
-                Actor::Human,
-                None,
-            )
-            .expect("group");
-        store
-            .apply(
-                &[Command::SetGroup {
+                &[Command::SetParent {
                     id: id.clone(),
-                    group: Some("Home".to_owned()),
+                    parent: Some(home.clone()),
+                    before: None,
                 }],
                 Actor::Human,
                 None,
             )
-            .expect("set group");
+            .expect("nest");
         let image = capture_board(store.connection()).expect("capture");
 
         let mut broken = image.clone();
-        broken["groups"] = serde_json::json!([]);
+        let kept: Vec<serde_json::Value> = broken["notes"]
+            .as_array()
+            .expect("notes array")
+            .iter()
+            .filter(|note| note["id"] != serde_json::json!(home))
+            .cloned()
+            .collect();
+        broken["notes"] = serde_json::json!(kept);
         let snapshot =
             record_snapshot(store.connection(), &broken, "broken", None).expect("record snapshot");
         let revision = board_revision(store.connection()).expect("revision");
@@ -2950,7 +2916,7 @@ mod tests {
         .expect("linked snapshot");
 
         // A later change makes the batch stale: report it, never clobber it.
-        let priority_batch = apply(&mut store, &[set_priority(&id, Priority::Low)]);
+        let priority_batch = apply(&mut store, &[set_important(&id)]);
         let before_try = counts(&store);
         let error = undo_last(&mut store).expect_err("conflict");
         match &error {

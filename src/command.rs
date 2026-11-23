@@ -15,9 +15,7 @@ use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::model::{
-    self, BatchId, Edge, EdgeId, Group, GroupId, LayoutMode, Note, NoteId, Priority, Status,
-};
+use crate::model::{self, BatchId, Edge, EdgeId, LayoutMode, Note, NoteId, Status};
 use crate::store::Store;
 use crate::time::{TimeError, TimeSpec};
 
@@ -46,19 +44,24 @@ impl Actor {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum Command {
+    /// Add a note. Placement, in order: `parent` (an existing note id), then
+    /// `container` (a name path such as "work/q4", matched case-insensitively
+    /// with "-"/"_" read as spaces; missing containers are created), then the
+    /// root when `at_root` is true, otherwise the Inbox (created on first use).
     AddNote {
         text: String,
-        /// Group name; a new group is created when the name is unknown.
-        #[serde(default)]
-        group: Option<String>,
         #[serde(default)]
         parent: Option<NoteId>,
+        #[serde(default, alias = "group")]
+        container: Option<String>,
+        #[serde(default)]
+        at_root: bool,
         #[serde(default)]
         due: Option<TimeSpec>,
         #[serde(default)]
         remind: Option<TimeSpec>,
         #[serde(default)]
-        priority: Option<Priority>,
+        important: bool,
         #[serde(default = "default_source")]
         source: String,
     },
@@ -66,21 +69,19 @@ pub enum Command {
         id: NoteId,
         text: String,
     },
-    /// Move a note into a group (by name) or back to the Inbox with null.
-    SetGroup {
-        id: NoteId,
-        #[serde(default)]
-        group: Option<String>,
-    },
+    /// Move a note under `parent` (root when null). With `before`, the note is
+    /// placed just before that sibling; otherwise it goes last when the parent
+    /// changes and keeps its place when it does not.
     SetParent {
         id: NoteId,
         #[serde(default)]
         parent: Option<NoteId>,
-    },
-    SetPriority {
-        id: NoteId,
         #[serde(default)]
-        priority: Option<Priority>,
+        before: Option<NoteId>,
+    },
+    SetImportant {
+        id: NoteId,
+        important: bool,
     },
     SetDue {
         id: NoteId,
@@ -119,15 +120,6 @@ pub enum Command {
     Unpin {
         id: NoteId,
     },
-    CreateGroup {
-        name: String,
-        #[serde(default)]
-        color: i64,
-    },
-    RenameGroup {
-        id: GroupId,
-        name: String,
-    },
     Link {
         from: NoteId,
         to: NoteId,
@@ -149,9 +141,8 @@ impl Command {
         match self {
             Self::AddNote { .. } => "add_note",
             Self::SetText { .. } => "set_text",
-            Self::SetGroup { .. } => "set_group",
             Self::SetParent { .. } => "set_parent",
-            Self::SetPriority { .. } => "set_priority",
+            Self::SetImportant { .. } => "set_important",
             Self::SetDue { .. } => "set_due",
             Self::SetRemind { .. } => "set_remind",
             Self::Snooze { .. } => "snooze",
@@ -162,8 +153,6 @@ impl Command {
             Self::Restore { .. } => "restore",
             Self::Pin { .. } => "pin",
             Self::Unpin { .. } => "unpin",
-            Self::CreateGroup { .. } => "create_group",
-            Self::RenameGroup { .. } => "rename_group",
             Self::Link { .. } => "link",
             Self::Unlink { .. } => "unlink",
         }
@@ -184,7 +173,6 @@ pub struct Effect {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct NewIds {
     pub notes: Vec<NoteId>,
-    pub groups: Vec<GroupId>,
     pub edges: Vec<EdgeId>,
 }
 
@@ -213,8 +201,8 @@ pub enum CommandError {
     #[error("{entity} {id:?} not found")]
     NotFound { entity: &'static str, id: String },
 
-    #[error("group {name:?} already exists")]
-    DuplicateGroup { name: String },
+    #[error("the Inbox cannot be {action}")]
+    Inbox { action: &'static str },
 
     #[error("a note cannot be its own ancestor")]
     Cycle,
@@ -452,58 +440,139 @@ fn load_edge_any(tx: &Transaction<'_>, id: &str) -> Result<Option<Edge>, Command
     Ok(model::load_edge(tx, id)?)
 }
 
-fn next_group_sort(tx: &Transaction<'_>) -> Result<i64, CommandError> {
-    let sort = tx.query_row(
-        "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM groups WHERE deleted_at_utc_ms IS NULL",
-        [],
-        |row| row.get(0),
-    )?;
-    Ok(sort)
-}
-
-fn next_note_sort(
-    tx: &Transaction<'_>,
-    parent: Option<&str>,
-    group: Option<&str>,
-) -> Result<i64, CommandError> {
+fn next_note_sort(tx: &Transaction<'_>, parent: Option<&str>) -> Result<i64, CommandError> {
     let sort = tx.query_row(
         "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM notes
-          WHERE deleted_at_utc_ms IS NULL AND parent_id IS ?1 AND group_id IS ?2",
-        params![parent, group],
+          WHERE deleted_at_utc_ms IS NULL AND parent_id IS ?1",
+        params![parent],
         |row| row.get(0),
     )?;
     Ok(sort)
 }
 
-/// Finds an active group by name or creates one, returning its id.
-fn resolve_or_create_group(
+/// The live Inbox, created (as a root container) when it does not exist yet.
+fn ensure_inbox(
     ctx: &mut Ctx<'_>,
     tx: &Transaction<'_>,
     command: &Command,
-    name: &str,
-) -> Result<GroupId, CommandError> {
-    let name = name.trim();
-    if name.is_empty() {
-        return Err(invalid("group name is empty"));
-    }
-    if let Some(id) = model::find_group_by_name(tx, name)? {
+) -> Result<NoteId, CommandError> {
+    if let Some(id) = model::find_inbox(tx)? {
         return Ok(id);
     }
-
     let id = new_id();
-    let sort = next_group_sort(tx)?;
-    tx.execute(
-        "INSERT INTO groups (id, name, color, sort_order, created_at_utc_ms, updated_at_utc_ms)
-         VALUES (?1, ?2, 0, ?3, ?4, ?4)",
-        params![id, name, sort, ctx.now],
+    let sort: i64 = tx.query_row(
+        "SELECT COALESCE(MIN(sort_order), 0) - 1 FROM notes
+          WHERE deleted_at_utc_ms IS NULL AND parent_id IS NULL",
+        [],
+        |row| row.get(0),
     )?;
-    let group = model::load_group(tx, &id)?.ok_or_else(|| CommandError::NotFound {
-        entity: "group",
-        id: id.clone(),
-    })?;
-    ctx.event(tx, command, "group", &id, None, Some(to_value(&group)?))?;
-    ctx.new_ids.groups.push(id.clone());
+    tx.execute(
+        "INSERT INTO notes (id, text, layout_mode, sort_order, role, status, source,
+                            created_at_utc_ms, updated_at_utc_ms)
+         VALUES (?1, 'Inbox', 'flow', ?2, 'inbox', 'open', 'system', ?3, ?3)",
+        params![id, sort, ctx.now],
+    )?;
+    let note = reload_note(tx, &id)?;
+    ctx.event(tx, command, "note", &id, None, Some(to_value(&note)?))?;
     Ok(id)
+}
+
+/// Find or create each container along a "a/b/c" name path, starting at the
+/// root, and return the last one.
+fn resolve_container_path(
+    ctx: &mut Ctx<'_>,
+    tx: &Transaction<'_>,
+    command: &Command,
+    path: &str,
+) -> Result<NoteId, CommandError> {
+    let segments: Vec<&str> = path
+        .split('/')
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    if segments.is_empty() {
+        return Err(invalid("container name is empty"));
+    }
+    let mut parent: Option<NoteId> = None;
+    for segment in segments {
+        let found = model::find_child_by_name(tx, parent.as_deref(), segment)?;
+        let id = match found {
+            Some(id) => id,
+            None => {
+                let id = new_id();
+                let sort = next_note_sort(tx, parent.as_deref())?;
+                let title = segment.replace(['-', '_'], " ");
+                tx.execute(
+                    "INSERT INTO notes (id, text, parent_id, layout_mode, sort_order, status,
+                                        source, created_at_utc_ms, updated_at_utc_ms)
+                     VALUES (?1, ?2, ?3, 'flow', ?4, 'open', 'capture', ?5, ?5)",
+                    params![id, title, parent, sort, ctx.now],
+                )?;
+                let note = reload_note(tx, &id)?;
+                ctx.event(tx, command, "note", &id, None, Some(to_value(&note)?))?;
+                id
+            }
+        };
+        parent = Some(id);
+    }
+    parent.ok_or_else(|| invalid("container name is empty"))
+}
+
+fn ensure_not_inbox(note: &Note, action: &'static str) -> Result<(), CommandError> {
+    if note.inbox {
+        Err(CommandError::Inbox { action })
+    } else {
+        Ok(())
+    }
+}
+
+/// Place `id` among the children of `parent`, before `before` when given,
+/// otherwise last. Siblings whose sort order changes get their own events.
+fn reorder_siblings(
+    ctx: &mut Ctx<'_>,
+    tx: &Transaction<'_>,
+    command: &Command,
+    id: &str,
+    parent: Option<&str>,
+    before: Option<&str>,
+) -> Result<usize, CommandError> {
+    let mut siblings: Vec<(NoteId, i64)> = {
+        let mut statement = tx.prepare(
+            "SELECT id, sort_order FROM notes
+              WHERE deleted_at_utc_ms IS NULL AND parent_id IS ?1 AND id <> ?2
+              ORDER BY sort_order, id",
+        )?;
+        let rows = statement.query_map(params![parent, id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        rows.collect::<Result<_, _>>()?
+    };
+    let index = match before {
+        Some(before) => siblings
+            .iter()
+            .position(|(sibling, _)| sibling == before)
+            .ok_or_else(|| invalid("`before` is not a sibling under the target parent"))?,
+        None => siblings.len(),
+    };
+    siblings.insert(index, (id.to_owned(), i64::MIN));
+    let mut written = 0;
+    for (position, (sibling, sort)) in siblings.iter().enumerate() {
+        let position = position as i64;
+        if *sort == position {
+            continue;
+        }
+        let before_image = reload_note(tx, sibling)?;
+        tx.execute(
+            "UPDATE notes SET sort_order = ?1 WHERE id = ?2 AND deleted_at_utc_ms IS NULL",
+            params![position, sibling],
+        )?;
+        let after_image = reload_note(tx, sibling)?;
+        if sibling != id {
+            emit_note(ctx, tx, command, &before_image, &after_image)?;
+            written += 1;
+        }
+    }
+    Ok(written)
 }
 
 fn ensure_no_cycle(
@@ -596,33 +665,11 @@ fn apply_one(
             emit_note(ctx, tx, command, &before, &after)?;
             Ok(effect_for(command, "note", id, 1))
         }
-        Command::SetGroup { id, group } => {
-            let before = ensure_active_note(tx, id)?;
-            let group_id = match group {
-                Some(name) => {
-                    let name = name.trim();
-                    if name.is_empty() {
-                        return Err(invalid("group name is empty"));
-                    }
-                    Some(model::find_group_by_name(tx, name)?.ok_or_else(|| {
-                        CommandError::NotFound {
-                            entity: "group",
-                            id: name.to_owned(),
-                        }
-                    })?)
-                }
-                None => None,
-            };
-            tx.execute(
-                "UPDATE notes SET group_id = ?1 WHERE id = ?2 AND deleted_at_utc_ms IS NULL",
-                params![group_id, id],
-            )?;
-            let after = reload_note(tx, id)?;
-            emit_note(ctx, tx, command, &before, &after)?;
-            Ok(effect_for(command, "note", id, 1))
-        }
-        Command::SetParent { id, parent } => {
-            let before = ensure_active_note(tx, id)?;
+        Command::SetParent { id, parent, before } => {
+            let before_note = ensure_active_note(tx, id)?;
+            if parent.is_some() {
+                ensure_not_inbox(&before_note, "nested")?;
+            }
             if let Some(parent_id) = parent {
                 if parent_id == id {
                     return Err(CommandError::Cycle);
@@ -631,7 +678,7 @@ fn apply_one(
                 ensure_no_cycle(tx, id, parent_id)?;
             }
             // A child cannot stay pinned: pinned positions belong to roots.
-            let unpin = parent.is_some() && before.layout == LayoutMode::Pinned;
+            let unpin = parent.is_some() && before_note.layout == LayoutMode::Pinned;
             if unpin {
                 tx.execute(
                     "UPDATE notes SET parent_id = ?1, layout_mode = 'flow', pos_x = NULL, pos_y = NULL
@@ -644,15 +691,21 @@ fn apply_one(
                     params![parent, id],
                 )?;
             }
+            let moved = before_note.parent != *parent;
+            let mut affected = 1;
+            if before.is_some() || moved {
+                affected +=
+                    reorder_siblings(ctx, tx, command, id, parent.as_deref(), before.as_deref())?;
+            }
             let after = reload_note(tx, id)?;
-            emit_note(ctx, tx, command, &before, &after)?;
-            Ok(effect_for(command, "note", id, 1))
+            emit_note(ctx, tx, command, &before_note, &after)?;
+            Ok(effect_for(command, "note", id, affected))
         }
-        Command::SetPriority { id, priority } => {
+        Command::SetImportant { id, important } => {
             let before = ensure_active_note(tx, id)?;
             tx.execute(
-                "UPDATE notes SET priority = ?1 WHERE id = ?2 AND deleted_at_utc_ms IS NULL",
-                params![priority.map(Priority::as_str), id],
+                "UPDATE notes SET important = ?1 WHERE id = ?2 AND deleted_at_utc_ms IS NULL",
+                params![i64::from(*important), id],
             )?;
             let after = reload_note(tx, id)?;
             emit_note(ctx, tx, command, &before, &after)?;
@@ -721,6 +774,7 @@ fn apply_one(
         }
         Command::Complete { id } => {
             let before = ensure_active_note(tx, id)?;
+            ensure_not_inbox(&before, "completed")?;
             tx.execute(
                 "UPDATE notes SET status = 'done', completed_at_utc_ms = ?1
                   WHERE id = ?2 AND deleted_at_utc_ms IS NULL",
@@ -772,8 +826,6 @@ fn apply_one(
             emit_note(ctx, tx, command, &before, &after)?;
             Ok(effect_for(command, "note", id, 1))
         }
-        Command::CreateGroup { name, color } => create_group(ctx, tx, command, name, *color),
-        Command::RenameGroup { id, name } => rename_group(ctx, tx, command, id, name),
         Command::Link { from, to, kind } => link(ctx, tx, command, from, to, kind.as_deref()),
         Command::Unlink { edge_id } => unlink(ctx, tx, command, edge_id),
     }
@@ -795,24 +847,17 @@ fn add_note(
 ) -> Result<Effect, CommandError> {
     let Command::AddNote {
         text,
-        group,
         parent,
+        container,
+        at_root,
         due,
         remind,
-        priority,
+        important,
         source,
     } = command
     else {
         return Err(invalid("internal: add_note received another command"));
     };
-
-    let group_id = match group {
-        Some(name) => Some(resolve_or_create_group(ctx, tx, command, name)?),
-        None => None,
-    };
-    if let Some(parent_id) = parent {
-        ensure_active_note(tx, parent_id)?;
-    }
 
     let due_parts = due
         .as_ref()
@@ -831,22 +876,33 @@ fn add_note(
         return Err(invalid("source is empty"));
     }
 
+    let parent: Option<NoteId> = match (parent, container.as_deref().map(str::trim)) {
+        (Some(parent_id), _) => {
+            ensure_active_note(tx, parent_id)?;
+            Some(parent_id.clone())
+        }
+        (None, Some(path)) if !path.is_empty() => {
+            Some(resolve_container_path(ctx, tx, command, path)?)
+        }
+        _ if *at_root => None,
+        _ => Some(ensure_inbox(ctx, tx, command)?),
+    };
+
     let id = new_id();
-    let sort = next_note_sort(tx, parent.as_deref(), group_id.as_deref())?;
+    let sort = next_note_sort(tx, parent.as_deref())?;
     tx.execute(
         "INSERT INTO notes
-             (id, text, group_id, parent_id, layout_mode, sort_order, color, priority,
+             (id, text, parent_id, layout_mode, sort_order, color, important,
               status, source, created_at_utc_ms, updated_at_utc_ms,
               due_local, due_tz, due_utc_ms, remind_local, remind_tz, remind_utc_ms)
-         VALUES (?1, ?2, ?3, ?4, 'flow', ?5, 0, ?6, 'open', ?7, ?8, ?8,
-                 ?9, ?10, ?11, ?12, ?13, ?14)",
+         VALUES (?1, ?2, ?3, 'flow', ?4, 0, ?5, 'open', ?6, ?7, ?7,
+                 ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             id,
             text.trim(),
-            group_id,
             parent,
             sort,
-            priority.map(Priority::as_str),
+            i64::from(*important),
             source,
             ctx.now,
             due_local,
@@ -871,7 +927,7 @@ fn delete_note(
     id: &str,
 ) -> Result<Effect, CommandError> {
     let root = ensure_active_note(tx, id)?;
-    let _ = root;
+    ensure_not_inbox(&root, "deleted")?;
     let note_ids = collect_subtree(tx, id, false)?;
     let edge_ids = touching_edge_ids(tx, &note_ids, None)?;
     let mut affected = 0;
@@ -973,93 +1029,6 @@ fn restore_note(
     }
 
     Ok(effect_for(command, "note", id, affected))
-}
-
-fn create_group(
-    ctx: &mut Ctx<'_>,
-    tx: &Transaction<'_>,
-    command: &Command,
-    name: &str,
-    color: i64,
-) -> Result<Effect, CommandError> {
-    let name = name.trim();
-    if name.is_empty() {
-        return Err(invalid("group name is empty"));
-    }
-    if color < 0 {
-        return Err(invalid("group colour must not be negative"));
-    }
-    if model::find_group_by_name(tx, name)?.is_some() {
-        return Err(CommandError::DuplicateGroup {
-            name: name.to_owned(),
-        });
-    }
-    let id = new_id();
-    let sort = next_group_sort(tx)?;
-    tx.execute(
-        "INSERT INTO groups (id, name, color, sort_order, created_at_utc_ms, updated_at_utc_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-        params![id, name, color, sort, ctx.now],
-    )?;
-    let group = model::load_group(tx, &id)?.ok_or_else(|| CommandError::NotFound {
-        entity: "group",
-        id: id.clone(),
-    })?;
-    ctx.event(tx, command, "group", &id, None, Some(to_value(&group)?))?;
-    ctx.new_ids.groups.push(id.clone());
-    Ok(effect_for(command, "group", &id, 1))
-}
-
-fn rename_group(
-    ctx: &mut Ctx<'_>,
-    tx: &Transaction<'_>,
-    command: &Command,
-    id: &str,
-    name: &str,
-) -> Result<Effect, CommandError> {
-    let name = name.trim();
-    if name.is_empty() {
-        return Err(invalid("group name is empty"));
-    }
-    let before = model::load_group(tx, id)?.ok_or_else(|| CommandError::NotFound {
-        entity: "group",
-        id: id.to_owned(),
-    })?;
-    if before.deleted_at_utc_ms.is_some() {
-        return Err(CommandError::NotFound {
-            entity: "group",
-            id: id.to_owned(),
-        });
-    }
-    let duplicate: i64 = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM groups
-                        WHERE deleted_at_utc_ms IS NULL
-                          AND lower(name) = lower(?1) AND id <> ?2)",
-        params![name, id],
-        |row| row.get(0),
-    )?;
-    if duplicate != 0 {
-        return Err(CommandError::DuplicateGroup {
-            name: name.to_owned(),
-        });
-    }
-    tx.execute(
-        "UPDATE groups SET name = ?1 WHERE id = ?2",
-        params![name, id],
-    )?;
-    let after = model::load_group(tx, id)?.ok_or_else(|| CommandError::NotFound {
-        entity: "group",
-        id: id.to_owned(),
-    })?;
-    ctx.event(
-        tx,
-        command,
-        "group",
-        id,
-        Some(to_value(&before)?),
-        Some(to_value(&after)?),
-    )?;
-    Ok(effect_for(command, "group", id, 1))
 }
 
 fn link(
@@ -1164,21 +1133,6 @@ pub fn open_notes(board: &model::Board) -> Vec<&Note> {
         .collect()
 }
 
-/// A group with its active notes, ready for the canvas.
-pub fn group_notes<'a>(board: &'a model::Board, group: Option<&Group>) -> Vec<&'a Note> {
-    let group_id = group.map(|group| group.id.as_str());
-    board
-        .notes
-        .iter()
-        .filter(|note| note.group.as_deref() == group_id && note.parent.is_none())
-        .collect()
-}
-
-/// A group created in this batch, if any (helper for tests and the UI).
-pub fn created_group(applied: &Applied) -> Option<&GroupId> {
-    applied.new_ids.groups.first()
-}
-
 /// The batch id as a string (helper for callers that store it).
 pub fn batch_id(applied: &Applied) -> &str {
     applied.batch_id.as_str()
@@ -1199,11 +1153,12 @@ mod tests {
             .apply(
                 &[Command::AddNote {
                     text: text.to_owned(),
-                    group: None,
+                    container: None,
+                    at_root: true,
                     parent: None,
                     due: None,
                     remind: None,
-                    priority: None,
+                    important: false,
                     source: "test".to_owned(),
                 }],
                 Actor::Human,
@@ -1230,14 +1185,15 @@ mod tests {
             .apply(
                 &[Command::AddNote {
                     text: "buy milk".to_owned(),
-                    group: Some("Home".to_owned()),
+                    container: Some("Home".to_owned()),
+                    at_root: false,
                     parent: None,
                     due: Some(TimeSpec {
                         local: "2026-11-23T09:00:00".to_owned(),
                         tz: "Europe/London".to_owned(),
                     }),
                     remind: None,
-                    priority: Some(Priority::High),
+                    important: true,
                     source: "capture".to_owned(),
                 }],
                 Actor::Human,
@@ -1248,14 +1204,19 @@ mod tests {
         assert_eq!(applied.effects.len(), 1);
         assert_eq!(applied.effects[0].command, "add_note");
         assert_eq!(applied.new_ids.notes.len(), 1);
-        assert_eq!(applied.new_ids.groups.len(), 1);
         assert!(model::batch_exists(store.connection(), &applied.batch_id).unwrap());
 
         let note = note(&store, &applied.new_ids.notes[0]);
         assert_eq!(note.text, "buy milk");
-        assert_eq!(note.priority, Some(Priority::High));
+        assert!(note.important);
         assert_eq!(note.source, "capture");
-        assert_eq!(note.group, Some(applied.new_ids.groups[0].clone()));
+        let container = board(&store)
+            .notes
+            .into_iter()
+            .find(|candidate| Some(&candidate.id) == note.parent.as_ref())
+            .expect("the note sits in a new container");
+        assert_eq!(container.text, "Home");
+        assert_eq!(container.parent, None);
         assert_eq!(note.due.expect("due").local, "2026-11-23T09:00:00");
         assert_eq!(
             store
@@ -1264,45 +1225,138 @@ mod tests {
                     .get::<_, i64>(0))
                 .unwrap(),
             2,
-            "one event for the note and one for the created group"
+            "one event for the note and one for the created container"
         );
-        assert_eq!(board(&store).groups[0].name, "Home");
     }
 
     #[test]
-    fn a_known_group_is_reused() {
+    fn a_known_container_is_reused_and_paths_nest() {
         let mut store = store("cmd-group-reuse");
-        store
-            .apply(
-                &[Command::CreateGroup {
-                    name: "Work".to_owned(),
-                    color: 2,
-                }],
-                Actor::Human,
-                None,
-            )
-            .expect("create group");
+        let work = add(&mut store, "Work");
         let applied = store
             .apply(
                 &[Command::AddNote {
                     text: "ship it".to_owned(),
-                    group: Some("work".to_owned()),
+                    container: Some("work/q4-plan".to_owned()),
+                    at_root: false,
                     parent: None,
                     due: None,
                     remind: None,
-                    priority: None,
+                    important: false,
                     source: "human".to_owned(),
                 }],
                 Actor::Human,
                 None,
             )
             .expect("add");
-        assert!(applied.new_ids.groups.is_empty(), "no duplicate group");
-        assert_eq!(board(&store).groups.len(), 1);
+        let board = board(&store);
+        let note = board.note(&applied.new_ids.notes[0]).expect("note");
+        let q4 = board
+            .note(note.parent.as_deref().expect("parent"))
+            .expect("q4");
+        assert_eq!(q4.text, "q4 plan");
+        assert_eq!(q4.parent.as_deref(), Some(work.as_str()), "Work is reused");
+        let roots = board.notes.iter().filter(|n| n.parent.is_none()).count();
+        assert_eq!(roots, 1, "no duplicate Work container");
     }
 
     #[test]
-    fn set_text_and_priority_round_trip() {
+    fn notes_without_placement_go_to_one_inbox_that_cannot_be_deleted() {
+        let mut store = store("cmd-inbox");
+        let add_loose = |store: &mut Store, text: &str| {
+            store
+                .apply(
+                    &[Command::AddNote {
+                        text: text.to_owned(),
+                        parent: None,
+                        container: None,
+                        at_root: false,
+                        due: None,
+                        remind: None,
+                        important: false,
+                        source: "human".to_owned(),
+                    }],
+                    Actor::Human,
+                    None,
+                )
+                .expect("add")
+                .new_ids
+                .notes[0]
+                .clone()
+        };
+        let first = add_loose(&mut store, "first");
+        let second = add_loose(&mut store, "second");
+        let board = board(&store);
+        let inbox = board.inbox().expect("an inbox exists").clone();
+        assert_eq!(board.note(&first).unwrap().parent.as_ref(), Some(&inbox.id));
+        assert_eq!(
+            board.note(&second).unwrap().parent.as_ref(),
+            Some(&inbox.id)
+        );
+        assert_eq!(board.notes.iter().filter(|note| note.inbox).count(), 1);
+
+        for command in [
+            Command::Delete {
+                id: inbox.id.clone(),
+            },
+            Command::Complete {
+                id: inbox.id.clone(),
+            },
+            Command::SetParent {
+                id: inbox.id.clone(),
+                parent: Some(first.clone()),
+                before: None,
+            },
+        ] {
+            let error = store
+                .apply(&[command], Actor::Human, None)
+                .expect_err("the Inbox is protected");
+            assert!(error.to_string().contains("Inbox"), "{error}");
+        }
+    }
+
+    #[test]
+    fn set_parent_with_before_reorders_siblings() {
+        let mut store = store("cmd-reorder");
+        let parent = add(&mut store, "parent");
+        let mut kids = Vec::new();
+        for text in ["a", "b", "c"] {
+            let id = add(&mut store, text);
+            store
+                .apply(
+                    &[Command::SetParent {
+                        id: id.clone(),
+                        parent: Some(parent.clone()),
+                        before: None,
+                    }],
+                    Actor::Human,
+                    None,
+                )
+                .expect("nest");
+            kids.push(id);
+        }
+        store
+            .apply(
+                &[Command::SetParent {
+                    id: kids[2].clone(),
+                    parent: Some(parent.clone()),
+                    before: Some(kids[0].clone()),
+                }],
+                Actor::Human,
+                None,
+            )
+            .expect("reorder");
+        let board = board(&store);
+        let order: Vec<&str> = board
+            .children(Some(&parent))
+            .iter()
+            .map(|note| note.text.as_str())
+            .collect();
+        assert_eq!(order, vec!["c", "a", "b"]);
+    }
+
+    #[test]
+    fn set_text_and_importance_round_trip() {
         let mut store = store("cmd-set");
         let id = add(&mut store, "first");
         store
@@ -1312,9 +1366,9 @@ mod tests {
                         id: id.clone(),
                         text: "second".to_owned(),
                     },
-                    Command::SetPriority {
+                    Command::SetImportant {
                         id: id.clone(),
-                        priority: Some(Priority::Low),
+                        important: true,
                     },
                 ],
                 Actor::Human,
@@ -1323,7 +1377,7 @@ mod tests {
             .expect("apply");
         let note = note(&store, &id);
         assert_eq!(note.text, "second");
-        assert_eq!(note.priority, Some(Priority::Low));
+        assert!(note.important);
         assert_eq!(note.version, 3, "initial insert plus two updates");
     }
 
@@ -1337,6 +1391,7 @@ mod tests {
                 &[Command::SetParent {
                     id: b.clone(),
                     parent: Some(a.clone()),
+                    before: None,
                 }],
                 Actor::Human,
                 None,
@@ -1349,6 +1404,7 @@ mod tests {
                 &[Command::SetParent {
                     id: a.clone(),
                     parent: Some(b.clone()),
+                    before: None,
                 }],
                 Actor::Human,
                 None,
@@ -1372,11 +1428,12 @@ mod tests {
             .apply(
                 &[Command::AddNote {
                     text: "child".to_owned(),
-                    group: None,
+                    container: None,
+                    at_root: true,
                     parent: Some(parent.clone()),
                     due: None,
                     remind: None,
-                    priority: None,
+                    important: false,
                     source: "test".to_owned(),
                 }],
                 Actor::Human,
@@ -1434,11 +1491,12 @@ mod tests {
                 &[
                     Command::AddNote {
                         text: "kept only if the batch commits".to_owned(),
-                        group: None,
+                        container: None,
+                        at_root: true,
                         parent: None,
                         due: None,
                         remind: None,
-                        priority: None,
+                        important: false,
                         source: "test".to_owned(),
                     },
                     Command::SetText {
@@ -1507,11 +1565,12 @@ mod tests {
             .apply(
                 &[Command::AddNote {
                     text: "child".to_owned(),
-                    group: None,
+                    container: None,
+                    at_root: true,
                     parent: Some(parent.clone()),
                     due: None,
                     remind: None,
-                    priority: None,
+                    important: false,
                     source: "test".to_owned(),
                 }],
                 Actor::Human,
@@ -1556,6 +1615,7 @@ mod tests {
                 &[Command::SetParent {
                     id: parent.clone(),
                     parent: Some(child.clone()),
+                    before: None,
                 }],
                 Actor::Human,
                 None,
@@ -1567,6 +1627,7 @@ mod tests {
                 &[Command::SetParent {
                     id: parent.clone(),
                     parent: Some(other.clone()),
+                    before: None,
                 }],
                 Actor::Human,
                 None,
@@ -1653,43 +1714,15 @@ mod tests {
     }
 
     #[test]
-    fn groups_validate_names() {
-        let mut store = store("cmd-groups");
-        store
-            .apply(
-                &[Command::CreateGroup {
-                    name: "Home".to_owned(),
-                    color: 0,
-                }],
-                Actor::Human,
-                None,
-            )
-            .expect("create");
-        assert!(
-            store
-                .apply(
-                    &[Command::CreateGroup {
-                        name: "home".to_owned(),
-                        color: 0
-                    }],
-                    Actor::Human,
-                    None
-                )
-                .is_err(),
-            "duplicate names are rejected case-insensitively"
-        );
-        let id = board(&store).groups[0].id.clone();
-        store
-            .apply(
-                &[Command::RenameGroup {
-                    id: id.clone(),
-                    name: "House".to_owned(),
-                }],
-                Actor::Human,
-                None,
-            )
-            .expect("rename");
-        assert_eq!(board(&store).groups[0].name, "House");
+    fn the_legacy_group_field_is_read_as_a_container() {
+        let decoded: Command = serde_json::from_str(
+            r#"{"command":"add_note","text":"a","group":"Home","priority":"high"}"#,
+        )
+        .expect("old agent JSON still decodes");
+        assert!(matches!(
+            decoded,
+            Command::AddNote { ref container, .. } if container.as_deref() == Some("Home")
+        ));
     }
 
     #[test]
@@ -1697,11 +1730,12 @@ mod tests {
         let commands = vec![
             Command::AddNote {
                 text: "x".to_owned(),
-                group: None,
+                container: None,
+                at_root: true,
                 parent: None,
                 due: None,
                 remind: None,
-                priority: None,
+                important: false,
                 source: "human".to_owned(),
             },
             Command::SetText {
@@ -1734,11 +1768,12 @@ mod tests {
             .apply(
                 &[Command::AddNote {
                     text: "child".to_owned(),
-                    group: None,
+                    container: None,
+                    at_root: true,
                     parent: Some(parent.clone()),
                     due: None,
                     remind: None,
-                    priority: None,
+                    important: false,
                     source: "test".to_owned(),
                 }],
                 Actor::Human,

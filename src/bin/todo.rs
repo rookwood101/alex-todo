@@ -6,14 +6,14 @@
 //!
 //! * 0 - success
 //! * 2 - usage error or rejected input
-//! * 3 - note/group/edge not found
+//! * 3 - note/edge not found
 //! * 5 - database or internal error
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
 use rustboard::command::{Actor, Applied, Command, CommandError};
-use rustboard::model::{Board, Note, Priority, Status};
+use rustboard::model::{Board, Note, Status};
 use rustboard::store::{Store, StorePaths, schema};
 use rustboard::time::{self, TimeSpec};
 
@@ -25,22 +25,23 @@ Usage:
 
 Commands:
   add TEXT...            Add a note (capture syntax unless --raw)
-      --group NAME       put the note in a group (created if unknown)
+      --in PATH          put the note in a container such as 'work/q4' (created if missing)
       --parent ID        make the note a child of another note
+      --root             put the note at the root instead of the Inbox
       --due WHEN         deadline (civil time, date, or phrase like 'tomorrow 4pm')
       --remind WHEN      reminder time
-      --priority P       low | med | high
+      --important        mark the note important
       --raw              store TEXT exactly as typed
   list                   List active notes (--json for the whole board)
   show ID                Show one note
-  set ID [--text T] [--group NAME] [--due WHEN] [--remind WHEN]
-         [--priority P] [--snooze WHEN] [--unsnooze]
+  set ID [--text T] [--due WHEN] [--remind WHEN]
+         [--important yes|no] [--snooze WHEN] [--unsnooze]
   done ID                Mark a note done
   reopen ID              Reopen a note (re-arms its reminder)
   delete ID              Soft-delete a note and its subtree
   restore ID             Restore a deleted subtree
   snooze ID WHEN         Snooze a note
-  move ID [--group NAME] [--parent ID] [--root]
+  move ID [--parent ID] [--root] [--before ID]
   link FROM TO [--kind K]
   apply --json           Read a JSON array of commands from stdin
       --agent            record the batch as the agent
@@ -202,9 +203,6 @@ fn print_applied(applied: &Applied, json: bool, out: &mut dyn Write) -> Result<(
         for id in &applied.new_ids.notes {
             writeln!(out, "note {id}").map_err(|error| error.to_string())?;
         }
-        for id in &applied.new_ids.groups {
-            writeln!(out, "group {id}").map_err(|error| error.to_string())?;
-        }
         for id in &applied.new_ids.edges {
             writeln!(out, "edge {id}").map_err(|error| error.to_string())?;
         }
@@ -236,7 +234,7 @@ fn report_command_error(error: &CommandError, err: &mut dyn Write) -> i32 {
     match root_error(error) {
         CommandError::NotFound { .. } => 3,
         CommandError::Invalid { .. }
-        | CommandError::DuplicateGroup { .. }
+        | CommandError::Inbox { .. }
         | CommandError::Cycle
         | CommandError::Empty => 2,
         _ => 5,
@@ -259,25 +257,31 @@ fn add(
     err: &mut dyn Write,
 ) -> Result<i32, String> {
     let mut text_parts: Vec<String> = Vec::new();
-    let mut group: Option<String> = None;
+    let mut container: Option<String> = None;
     let mut parent: Option<String> = None;
+    let mut at_root = false;
     let mut due: Option<TimeSpec> = None;
     let mut remind: Option<TimeSpec> = None;
-    let mut priority: Option<Priority> = None;
+    let mut important = false;
     let mut source = "human".to_owned();
     let mut raw = false;
 
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
-            "--group" => {
+            "--in" | "--group" => {
                 index += 1;
-                group = Some(args.get(index).ok_or("--group needs a name")?.clone());
+                container = Some(
+                    args.get(index)
+                        .ok_or("--in needs a container path")?
+                        .clone(),
+                );
             }
             "--parent" => {
                 index += 1;
                 parent = Some(args.get(index).ok_or("--parent needs an id")?.clone());
             }
+            "--root" => at_root = true,
             "--due" => {
                 index += 1;
                 due = Some(parse_when(
@@ -292,12 +296,7 @@ fn add(
                     tz,
                 )?);
             }
-            "--priority" => {
-                index += 1;
-                priority = Some(parse_priority(
-                    args.get(index).ok_or("--priority needs a value")?,
-                )?);
-            }
+            "--important" => important = true,
             "--source" => {
                 index += 1;
                 source = args.get(index).ok_or("--source needs a value")?.clone();
@@ -319,9 +318,10 @@ fn add(
 
     let board = Board::load(store.connection()).map_err(|error| error.to_string())?;
     let known: Vec<String> = board
-        .groups
+        .notes
         .iter()
-        .map(|group| group.name.clone())
+        .filter(|note| note.parent.is_none() && board.has_children(&note.id))
+        .map(|note| note.text.lines().next().unwrap_or("").trim().to_owned())
         .collect();
     let parsed =
         rustboard::capture::parse_capture(&typed, rustboard::store::now_utc_ms(), tz, &known);
@@ -332,15 +332,16 @@ fn add(
         } else {
             parsed.text.clone()
         },
-        group: parsed
+        container: parsed
             .group
             .as_ref()
             .map(|group| group.name.clone())
-            .or(group),
+            .or(container),
         parent,
+        at_root,
         due: parsed.due.or(due),
         remind,
-        priority: parsed.priority.map(Priority::from).or(priority),
+        important: parsed.important || important,
         source,
     };
 
@@ -399,14 +400,14 @@ fn show(
         writeln!(out, "id:       {}", note.id).map_err(|error| error.to_string())?;
         writeln!(out, "text:     {}", note.text).map_err(|error| error.to_string())?;
         writeln!(out, "status:   {}", status_label(&note)).map_err(|error| error.to_string())?;
-        if let Some(group) = &note.group {
-            writeln!(out, "group:    {group}").map_err(|error| error.to_string())?;
-        }
         if let Some(parent) = &note.parent {
             writeln!(out, "parent:   {parent}").map_err(|error| error.to_string())?;
         }
-        if let Some(priority) = note.priority {
-            writeln!(out, "priority: {}", priority.as_str()).map_err(|error| error.to_string())?;
+        if note.important {
+            writeln!(out, "important: yes").map_err(|error| error.to_string())?;
+        }
+        if note.inbox {
+            writeln!(out, "role:     inbox").map_err(|error| error.to_string())?;
         }
         if let Some(due) = &note.due {
             writeln!(out, "due:      {} {}", due.local, due.tz)
@@ -441,13 +442,6 @@ fn set(
                     text: args.get(index).ok_or("--text needs a value")?.clone(),
                 });
             }
-            "--group" => {
-                index += 1;
-                commands.push(Command::SetGroup {
-                    id: id.clone(),
-                    group: Some(args.get(index).ok_or("--group needs a name")?.clone()),
-                });
-            }
             "--due" => {
                 index += 1;
                 commands.push(Command::SetDue {
@@ -468,13 +462,11 @@ fn set(
                     )?),
                 });
             }
-            "--priority" => {
+            "--important" => {
                 index += 1;
-                commands.push(Command::SetPriority {
+                commands.push(Command::SetImportant {
                     id: id.clone(),
-                    priority: Some(parse_priority(
-                        args.get(index).ok_or("--priority needs a value")?,
-                    )?),
+                    important: parse_yes_no(args.get(index).ok_or("--important needs yes or no")?)?,
                 });
             }
             "--snooze" => {
@@ -537,36 +529,50 @@ fn move_note(
     let mut index = 1;
     while index < args.len() {
         match args[index].as_str() {
-            "--group" => {
-                index += 1;
-                commands.push(Command::SetGroup {
-                    id: id.clone(),
-                    group: Some(args.get(index).ok_or("--group needs a name")?.clone()),
-                });
-            }
             "--parent" => {
                 index += 1;
                 commands.push(Command::SetParent {
                     id: id.clone(),
                     parent: Some(args.get(index).ok_or("--parent needs an id")?.clone()),
+                    before: None,
                 });
             }
             "--root" => {
-                commands.push(Command::SetGroup {
-                    id: id.clone(),
-                    group: None,
-                });
                 commands.push(Command::SetParent {
                     id: id.clone(),
                     parent: None,
+                    before: None,
                 });
+            }
+            "--before" => {
+                index += 1;
+                let before = args
+                    .get(index)
+                    .ok_or("--before needs a sibling id")?
+                    .clone();
+                match commands.last_mut() {
+                    Some(Command::SetParent { before: slot, .. }) => *slot = Some(before),
+                    _ => {
+                        let board = Board::load(store.connection()).map_err(|e| e.to_string())?;
+                        let parent = board
+                            .note(&id)
+                            .ok_or_else(|| format!("note {id:?} not found"))?
+                            .parent
+                            .clone();
+                        commands.push(Command::SetParent {
+                            id: id.clone(),
+                            parent,
+                            before: Some(before),
+                        });
+                    }
+                }
             }
             other => return Err(format!("unknown option {other:?} for move")),
         }
         index += 1;
     }
     if commands.is_empty() {
-        let _ = writeln!(err, "error: move needs --group, --parent or --root");
+        let _ = writeln!(err, "error: move needs --parent, --root or --before");
         return Ok(2);
     }
     Ok(apply_commands(store, commands, json, out, err))
@@ -738,12 +744,11 @@ fn value_to_json(value: rusqlite::types::ValueRef<'_>) -> serde_json::Value {
     }
 }
 
-fn parse_priority(value: &str) -> Result<Priority, String> {
+fn parse_yes_no(value: &str) -> Result<bool, String> {
     match value.to_ascii_lowercase().as_str() {
-        "low" | "1" => Ok(Priority::Low),
-        "med" | "medium" | "2" => Ok(Priority::Medium),
-        "high" | "3" => Ok(Priority::High),
-        other => Err(format!("unknown priority {other:?} (low, med, high)")),
+        "yes" | "true" | "1" | "on" => Ok(true),
+        "no" | "false" | "0" | "off" => Ok(false),
+        other => Err(format!("expected yes or no, not {other:?}")),
     }
 }
 
@@ -834,9 +839,17 @@ mod tests {
 
         let board = board_json(&dir);
         let notes = board["notes"].as_array().expect("notes array");
-        assert_eq!(notes.len(), 1);
-        assert_eq!(notes[0]["text"], "buy milk");
-        assert_eq!(notes[0]["status"], "open");
+        assert_eq!(notes.len(), 2, "the note and the Inbox it landed in");
+        let inbox = notes
+            .iter()
+            .find(|note| note["inbox"] == true)
+            .expect("inbox");
+        let note = notes
+            .iter()
+            .find(|note| note["text"] == "buy milk")
+            .expect("note");
+        assert_eq!(note["status"], "open");
+        assert_eq!(note["parent"], inbox["id"]);
     }
 
     #[test]
@@ -845,16 +858,23 @@ mod tests {
         let (code, _out, err) = cli_in(&dir, &["add", "buy milk tomorrow #home"], "");
         assert_eq!(code, 0, "add failed: {err}");
         let board = board_json(&dir);
-        let note = &board["notes"][0];
-        assert_eq!(note["text"], "buy milk");
-        assert_eq!(note["group"], board["groups"][0]["id"]);
+        let notes = board["notes"].as_array().expect("notes");
+        let note = notes
+            .iter()
+            .find(|note| note["text"] == "buy milk")
+            .expect("note");
+        let home = notes
+            .iter()
+            .find(|candidate| candidate["text"] == "home")
+            .expect("container");
+        assert_eq!(note["parent"], home["id"]);
         assert!(note["due"]["local"].as_str().expect("due").contains('T'));
     }
 
     #[test]
     fn delete_hides_and_restore_returns() {
         let dir = scratch("delete");
-        let (code, out, err) = cli_in(&dir, &["add", "temporary"], "");
+        let (code, out, err) = cli_in(&dir, &["add", "--root", "temporary"], "");
         assert_eq!(code, 0, "add failed: {err}");
         let id = out
             .lines()
@@ -874,7 +894,7 @@ mod tests {
     #[test]
     fn apply_reads_a_json_batch() {
         let dir = scratch("apply");
-        let input = r#"[{"command":"add_note","text":"from json"}]"#;
+        let input = r#"[{"command":"add_note","text":"from json","at_root":true}]"#;
         let (code, out, err) = cli_in(&dir, &["apply", "--json"], input);
         assert_eq!(code, 0, "apply failed: {err} {out}");
         let board = board_json(&dir);
@@ -884,7 +904,7 @@ mod tests {
     #[test]
     fn query_is_read_only_and_reports_columns() {
         let dir = scratch("query");
-        let (code, _out, err) = cli_in(&dir, &["add", "one"], "");
+        let (code, _out, err) = cli_in(&dir, &["add", "--root", "one"], "");
         assert_eq!(code, 0, "add failed: {err}");
 
         let (code, out, err) = cli_in(
@@ -964,8 +984,8 @@ mod tests {
                 &id,
                 "--text",
                 "renamed",
-                "--priority",
-                "high",
+                "--important",
+                "yes",
                 "--due",
                 "tomorrow",
             ],
@@ -973,8 +993,15 @@ mod tests {
         );
         assert_eq!(code, 0, "set failed: {err}");
         let board = board_json(&dir);
-        assert_eq!(board["notes"][0]["text"], "renamed");
-        assert_eq!(board["notes"][0]["priority"], "high");
-        assert!(board["notes"][0]["due"]["local"].as_str().is_some());
+        let note = board["notes"]
+            .as_array()
+            .expect("notes")
+            .iter()
+            .find(|note| note["id"] == id.as_str())
+            .expect("note")
+            .clone();
+        assert_eq!(note["text"], "renamed");
+        assert_eq!(note["important"], true);
+        assert!(note["due"]["local"].as_str().is_some());
     }
 }
