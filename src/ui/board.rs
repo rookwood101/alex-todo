@@ -793,7 +793,6 @@ impl BoardView {
     /// Right-click on an arrow opens a small menu for it.
     fn edge_context_menu(
         &mut self,
-        ui: &mut Ui,
         context: &BoardContext<'_>,
         geometry: &Geometry,
         canvas_rect: Rect,
