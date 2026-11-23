@@ -15,16 +15,18 @@
 //!   `padding * 2 + sum(col_width + gap)` wide and
 //!   `header + sum(row_height + gap)` high (one max width per column and one
 //!   max height per row, so differently sized children never overlap).
-//! * Children are ordered by `sort`, then `id`.
+//! * Children are ordered open first, then done, then by `sort`, then `id`.
 //! * Root notes are grouped into columns: one column per group, ordered by the
 //!   `(GroupId, sort)` list supplied by the caller, followed by an Inbox column
 //!   for notes with no group. Groups that appear on notes but not in that list
 //!   are appended by id so no note is silently dropped.
-//! * `done` notes are omitted; `snoozed` notes are laid out normally.
+//! * `done` notes are laid out after their open siblings; `hidden` notes (the
+//!   caller's "Hide done" filter) are omitted; `snoozed` notes are laid out
+//!   normally.
 //! * Pinned root notes use their stored `x`/`y` and are excluded from the
 //!   column flow. Pinning a non-root note has no effect (child-level pinning is
 //!   unsupported).
-//! * A note whose parent is missing, or was omitted because it is done, becomes
+//! * A note whose parent is missing, or was omitted because it is hidden, becomes
 //!   a root. Cyclic parents are skipped defensively. Recursion stops after
 //!   [`DEPTH_CAP`] container levels; a note at that depth is drawn as a leaf and
 //!   its children are not placed.
@@ -162,8 +164,10 @@ pub struct LayoutNote {
     pub parent: Option<NoteId>,
     /// Group whose root column the note belongs to; `None` is the Inbox.
     pub group: Option<GroupId>,
-    /// Completed notes are omitted from the layout.
+    /// Completed notes sort after their open siblings.
     pub done: bool,
+    /// Hidden notes are omitted from the layout.
+    pub hidden: bool,
     /// Snoozed notes are still laid out; snoozing only dims them in the UI.
     pub snoozed: bool,
     /// Pinned root notes keep their stored `x`/`y`.
@@ -184,6 +188,7 @@ impl LayoutNote {
             parent: None,
             group: None,
             done: false,
+            hidden: false,
             snoozed: false,
             pinned: false,
             x: 0.0,
@@ -444,7 +449,7 @@ impl<'a> Planner<'a> {
     fn build(notes: &'a [LayoutNote]) -> Self {
         let mut index: HashMap<NoteId, usize> = HashMap::new();
         for (position, note) in notes.iter().enumerate() {
-            if note.done {
+            if note.hidden {
                 continue;
             }
             // First occurrence wins, so duplicate ids cannot corrupt the graph.
@@ -454,7 +459,7 @@ impl<'a> Planner<'a> {
         let mut children: HashMap<NoteId, Vec<NoteId>> = HashMap::new();
         let mut roots = Vec::new();
         for (position, note) in notes.iter().enumerate() {
-            if note.done || index.get(&note.id) != Some(&position) {
+            if note.hidden || index.get(&note.id) != Some(&position) {
                 continue;
             }
             match note.parent {
@@ -466,7 +471,7 @@ impl<'a> Planner<'a> {
                     if index.contains_key(&parent) {
                         children.entry(parent).or_default().push(note.id);
                     } else {
-                        // Missing or done parent: promote to a root so the note
+                        // Missing or hidden parent: promote to a root so the note
                         // stays visible.
                         roots.push(note.id);
                     }
@@ -479,8 +484,9 @@ impl<'a> Planner<'a> {
         for parent in parent_ids {
             if let Some(list) = children.get_mut(&parent) {
                 list.sort_by_key(|id| {
-                    let sort = index.get(id).map_or(0, |&position| notes[position].sort);
-                    (sort, *id)
+                    index.get(id).map_or((false, 0, *id), |&position| {
+                        (notes[position].done, notes[position].sort, *id)
+                    })
                 });
             }
         }
@@ -501,8 +507,9 @@ impl<'a> Planner<'a> {
             .and_then(|&position| self.notes.get(position))
     }
 
-    fn sort_key(&self, id: NoteId) -> (i64, NoteId) {
-        (self.note(id).map_or(0, |note| note.sort), id)
+    fn sort_key(&self, id: NoteId) -> (bool, i64, NoteId) {
+        self.note(id)
+            .map_or((false, 0, id), |note| (note.done, note.sort, id))
     }
 
     /// Bottom-up sizing with a depth cap and a defensive cycle guard.
@@ -795,9 +802,26 @@ mod tests {
     }
 
     #[test]
-    fn done_notes_are_omitted() {
+    fn done_notes_sort_last_and_keep_their_children() {
         let mut done = LayoutNote::new(1);
         done.done = true;
+        let child = with_parent(2, 1);
+        let open = LayoutNote::new(3);
+
+        let layout = Layout::compute(&[done, child, open], &[]);
+        assert_eq!(layout.rects.len(), 3);
+        assert!(
+            layout.is_container(1),
+            "a done container keeps its children"
+        );
+        assert_eq!(layout.rects[&3].y, 0.0, "the open note sorts first");
+        assert_eq!(layout.rects[&1].y, LEAF_HEIGHT + CONTAINER_GAP);
+    }
+
+    #[test]
+    fn hidden_notes_are_omitted() {
+        let mut done = LayoutNote::new(1);
+        done.hidden = true;
         let promoted = with_parent(2, 1);
 
         let layout = Layout::compute(&[done, promoted, LayoutNote::new(3)], &[]);

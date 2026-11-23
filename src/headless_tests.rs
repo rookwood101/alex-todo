@@ -10,7 +10,7 @@ use eframe::egui::{
 use crate::app::RustboardApp;
 use crate::command::{Actor, Command};
 use crate::config::Config;
-use crate::model::Board;
+use crate::model::{Board, Status};
 use crate::store::{StorePaths, schema, scratch_dir};
 use crate::theme;
 
@@ -392,6 +392,90 @@ fn a_box_drag_and_shift_click_build_a_multi_selection() {
     let empty = pos2(all.max.x + 150.0, all.center().y);
     headless.click(empty);
     assert!(headless.app.view.selected.is_empty(), "empty canvas clears");
+}
+
+#[test]
+fn the_checkbox_completes_a_note_that_stays_visible() {
+    let mut headless = Headless::new("app-checkbox");
+    add_note(&mut headless.app, "task");
+    headless.run_frame(Vec::new());
+    let id = headless.note_ids()[0].clone();
+    let checkbox = headless
+        .app
+        .view
+        .checkbox_center_for(&headless.app.board, &id, headless.app.canvas_rect)
+        .expect("checkbox");
+
+    headless.click(checkbox);
+    let note = headless.app.board.note(&id).expect("note");
+    assert_eq!(note.status, Status::Done);
+    assert!(
+        !headless.app.view.is_editing(),
+        "the checkbox does not edit"
+    );
+    assert!(
+        headless
+            .app
+            .view
+            .screen_rect_for(&headless.app.board, &id, headless.app.canvas_rect)
+            .is_some(),
+        "a done note stays on the board"
+    );
+
+    headless.click(checkbox);
+    assert_eq!(
+        headless.app.board.note(&id).expect("note").status,
+        Status::Open
+    );
+}
+
+#[test]
+fn ctrl_enter_toggles_done_on_the_selection() {
+    let mut headless = Headless::new("app-ctrl-enter");
+    add_note(&mut headless.app, "a");
+    add_note(&mut headless.app, "b");
+    headless.run_frame(Vec::new());
+    headless.key_with(Key::A, CTRL);
+    headless.key_with(Key::Enter, CTRL);
+    assert!(
+        headless
+            .app
+            .board
+            .notes
+            .iter()
+            .all(|note| note.status == Status::Done)
+    );
+    assert!(!headless.app.view.is_editing(), "Ctrl+Enter is not Enter");
+    headless.key_with(Key::Enter, CTRL);
+    assert!(
+        headless
+            .app
+            .board
+            .notes
+            .iter()
+            .all(|note| note.status == Status::Open)
+    );
+}
+
+#[test]
+fn hide_done_removes_done_notes_and_is_saved() {
+    let mut headless = Headless::new("app-hide-done");
+    add_note(&mut headless.app, "task");
+    headless.run_frame(Vec::new());
+    let id = headless.note_ids()[0].clone();
+    headless
+        .app
+        .apply_commands(vec![Command::Complete { id: id.clone() }], "test");
+    headless.app.set_hide_done(true);
+    headless.run_frame(Vec::new());
+    assert!(headless.app.view.selected.is_empty());
+    headless.key_with(Key::A, CTRL);
+    assert!(
+        headless.app.view.selected.is_empty(),
+        "hidden notes cannot be selected"
+    );
+    let (config, _) = Config::load_for(&headless.app.paths);
+    assert!(config.hide_done);
 }
 
 #[test]

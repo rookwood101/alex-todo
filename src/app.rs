@@ -579,6 +579,7 @@ impl RustboardApp {
             board: &self.board,
             now_utc_ms: now,
             tz: &self.board_tz,
+            hide_done: self.config.hide_done,
         };
         egui::CentralPanel::no_frame()
             .show(ui, |ui| self.view.show(ui, &context))
@@ -686,6 +687,14 @@ impl RustboardApp {
             if ui.button("Fit view").clicked() {
                 self.view.fit_next_frame();
             }
+            let mut hide_done = self.config.hide_done;
+            if ui
+                .toggle_value(&mut hide_done, "Hide done")
+                .on_hover_text("Hide done notes that have no open children")
+                .changed()
+            {
+                self.set_hide_done(hide_done);
+            }
             if ui
                 .button("Board folder")
                 .on_hover_text(self.paths.home().display().to_string())
@@ -719,6 +728,14 @@ impl RustboardApp {
                     .on_hover_text("Pi tool profile for the chat panel");
             });
         });
+    }
+
+    /// Flip the "Hide done" filter and remember it in config.json.
+    pub(crate) fn set_hide_done(&mut self, hide: bool) {
+        self.config.hide_done = hide;
+        if let Err(error) = self.config.save(Config::path_for(&self.paths)) {
+            self.set_status(format!("Cannot save settings: {error}"), true);
+        }
     }
 
     fn agent_profile_label(&self) -> &'static str {
