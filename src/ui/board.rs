@@ -374,14 +374,7 @@ impl BoardView {
             );
         }
 
-        self.edge_context_menu(
-            ui,
-            context,
-            &geometry,
-            canvas_rect,
-            &background,
-            &mut output,
-        );
+        self.edge_context_menu(context, &geometry, canvas_rect, &background, &mut output);
 
         if self.drag.is_some() || self.pan_button.is_some() {
             ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
