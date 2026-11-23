@@ -73,9 +73,11 @@ all three binaries:
 | Click a note's checkbox / Ctrl+Enter | Toggle done (Ctrl+Enter acts on the selection) |
 | Hide done (toolbar) | Hide done notes that have no open children |
 | Delete or Backspace | Delete the selection (containers take their children); Undo is offered |
-| Drag a note | Move a root note (pins it) or reparent a child by dropping it on a container |
+| Drag a note (or the selection) | Drop on a note's left/right edge to reorder next to it, on its middle to nest inside it, on empty canvas to pin it there |
+| Ctrl+G / Ctrl+Shift+G | Group the selection into a new container / ungroup a container |
+| Click the "!" slot / Ctrl+I | Toggle important (shown as a red "!") |
 | Drag the dot on a selected note | Link it to another note |
-| Right-click a note | Edit, mark done/reopen, snooze, unsnooze, delete (acts on the whole selection) |
+| Right-click a note | Edit, done/reopen, important, snooze, unpin, group/ungroup, delete (acts on the whole selection) |
 | Tab (composer) | Switch Capture / Agent |
 | Enter (composer) | Create the note / send the prompt |
 | Shift+Enter | New line in the composer |

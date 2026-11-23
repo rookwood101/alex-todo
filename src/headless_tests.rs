@@ -515,6 +515,61 @@ fn hide_done_removes_done_notes_and_is_saved() {
 }
 
 #[test]
+fn ctrl_g_wraps_the_selection_and_edits_the_new_container() {
+    let mut headless = Headless::new("app-ctrl-g");
+    add_note(&mut headless.app, "a");
+    add_note(&mut headless.app, "b");
+    headless.run_frame(Vec::new());
+    let ids = headless.note_ids();
+    headless.key_with(Key::A, CTRL);
+    headless.key_with(Key::G, CTRL);
+
+    let container = headless
+        .app
+        .board
+        .notes
+        .iter()
+        .find(|note| !ids.contains(&note.id))
+        .expect("a new container")
+        .id
+        .clone();
+    for id in &ids {
+        assert_eq!(
+            headless.app.board.note(id).expect("note").parent.as_ref(),
+            Some(&container)
+        );
+    }
+    assert_eq!(headless.app.view.editing_note(), Some(&container));
+
+    headless.key(Key::Escape);
+    headless.app.view.select_only(container.clone());
+    headless.key_with(
+        Key::G,
+        Modifiers {
+            shift: true,
+            ..CTRL
+        },
+    );
+    assert!(headless.app.board.note(&container).is_none(), "ungrouped");
+    for id in &ids {
+        assert_eq!(headless.app.board.note(id).expect("note").parent, None);
+    }
+}
+
+#[test]
+fn ctrl_i_toggles_importance() {
+    let mut headless = Headless::new("app-ctrl-i");
+    add_note(&mut headless.app, "a");
+    headless.run_frame(Vec::new());
+    let id = headless.note_ids()[0].clone();
+    headless.app.view.select_only(id.clone());
+    headless.key_with(Key::I, CTRL);
+    assert!(headless.app.board.note(&id).expect("note").important);
+    headless.key_with(Key::I, CTRL);
+    assert!(!headless.app.board.note(&id).expect("note").important);
+}
+
+#[test]
 fn an_invalid_config_falls_back_to_defaults() {
     let paths = StorePaths::from_home(scratch_dir("app-config"));
     std::fs::create_dir_all(paths.home()).expect("home");

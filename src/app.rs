@@ -353,7 +353,8 @@ impl RustboardApp {
             "new note",
         );
         if let Some(id) = applied.and_then(|applied| applied.new_ids.notes.first().cloned()) {
-            self.view.edit_note(&self.board, id);
+            self.view.edit_note(&self.board, id.clone());
+            self.view.reveal(id);
         }
     }
 
@@ -561,8 +562,11 @@ impl RustboardApp {
             ComposerContext::new(now_utc_ms(), &self.board_tz, &self.group_names);
         let composer_output =
             composer::show(&mut self.composer, &ctx, self.chat.busy, &composer_context);
-        if let Some(command) = composer_output.capture {
-            self.apply_commands(vec![command], "capture");
+        if let Some(command) = composer_output.capture
+            && let Some(applied) = self.apply_commands(vec![command], "capture")
+            && let Some(id) = applied.new_ids.notes.first().cloned()
+        {
+            self.view.reveal(id);
         }
         if let Some(prompt) = composer_output.agent_prompt {
             self.send_prompt(prompt);
@@ -607,10 +611,19 @@ impl RustboardApp {
         } else {
             "canvas"
         };
-        if self.apply_commands(output.commands, label).is_some() && output.deleted_notes > 0 {
+        let Some(applied) = self.apply_commands(output.commands, label) else {
+            return;
+        };
+        if output.deleted_notes > 0 {
             let removed = before.saturating_sub(self.board.notes.len());
             let noun = if removed == 1 { "note" } else { "notes" };
             self.set_undoable_status(format!("Deleted {removed} {noun}"));
+        }
+        if output.edit_new_note
+            && let Some(id) = applied.new_ids.notes.first().cloned()
+        {
+            self.view.edit_note(&self.board, id.clone());
+            self.view.reveal(id);
         }
     }
 

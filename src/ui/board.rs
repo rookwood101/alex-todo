@@ -72,6 +72,8 @@ pub struct BoardOutput {
     /// Notes the frame asked to delete (roots of the deleted subtrees). The app
     /// uses it to offer Undo.
     pub deleted_notes: usize,
+    /// Open the editor on the batch's first new note (a Ctrl+G container).
+    pub edit_new_note: bool,
 }
 
 impl Default for BoardOutput {
@@ -81,6 +83,7 @@ impl Default for BoardOutput {
             canvas_rect: Rect::ZERO,
             editing: false,
             deleted_notes: 0,
+            edit_new_note: false,
         }
     }
 }
@@ -99,7 +102,9 @@ pub struct BoardView {
     fit_requested: bool,
     drag: Option<NoteDrag>,
     link: Option<LinkDrag>,
-    drop_target: Option<NoteId>,
+    drop_plan: Option<DropPlan>,
+    /// Pan the camera to this note once it has a rect.
+    reveal: Option<NoteId>,
     pan_button: Option<PointerButton>,
 }
 
@@ -112,6 +117,23 @@ struct NoteDrag {
     /// The note was already the only selection when the press started, so a
     /// click without movement opens the editor.
     reselect: bool,
+}
+
+/// Where a drag will land, recomputed every frame while dragging.
+#[derive(Clone, Debug, PartialEq)]
+enum DropPlan {
+    /// Append inside this note (it becomes or stays a container).
+    Nest { target: NoteId },
+    /// Insert among `parent`'s children, before `before` (None = last).
+    /// `marker` is the note whose edge shows the insertion line.
+    Place {
+        parent: Option<NoteId>,
+        before: Option<NoteId>,
+        marker: NoteId,
+        after: bool,
+    },
+    /// Pin at the root with the dragged note's top-left here (world units).
+    Pin { x: f32, y: f32 },
 }
 
 /// A selection box drawn by a left-drag on empty canvas.
@@ -149,7 +171,8 @@ impl BoardView {
             fit_requested: false,
             drag: None,
             link: None,
-            drop_target: None,
+            drop_plan: None,
+            reveal: None,
             pan_button: None,
         }
     }
@@ -222,6 +245,11 @@ impl BoardView {
         }
     }
 
+    /// Pan to a note on the next frame where it has a rect (new notes).
+    pub fn reveal(&mut self, id: NoteId) {
+        self.reveal = Some(id);
+    }
+
     /// Clear transient state after a board reload.
     pub fn after_reload(&mut self, board: &Board) {
         self.selected.retain(|id| board.note(id).is_some());
@@ -289,6 +317,13 @@ impl BoardView {
             } else {
                 self.camera.reset_to_origin();
             }
+        }
+
+        if let Some(id) = self.reveal.take()
+            && let Some(rect) = geometry.screen_rect(&id, &self.camera, canvas_rect)
+            && !canvas_rect.shrink(24.0).contains_rect(rect)
+        {
+            self.camera.pan_screen(canvas_rect.center() - rect.center());
         }
 
         self.handle_wheel(ui, canvas_rect);
@@ -450,12 +485,10 @@ impl BoardView {
                         drag.moved = true;
                     }
                     if drag.moved {
-                        self.drop_target = geometry.drop_target(
-                            context.board,
-                            &drag.id,
-                            world,
-                            &geometry.world_rects(),
-                        );
+                        let grab = drag.grab;
+                        let dragged = self.dragged_notes(context.board);
+                        self.drop_plan =
+                            Some(plan_drop(context.board, geometry, &dragged, world, grab));
                     }
                 }
             } else {
@@ -473,7 +506,7 @@ impl BoardView {
                     self.edit_note(context.board, drag.id.clone());
                 }
                 self.drag = None;
-                self.drop_target = None;
+                self.drop_plan = None;
             }
             ui.ctx().request_repaint();
             return;
@@ -544,6 +577,14 @@ impl BoardView {
 
         if let Some(id) = self.checkbox_at(geometry, context, pointer, canvas_rect) {
             output.commands.extend(toggle_done_commands(
+                context.board,
+                std::slice::from_ref(&id),
+            ));
+            return;
+        }
+
+        if let Some(id) = self.important_slot_at(geometry, context, pointer, canvas_rect) {
+            output.commands.extend(toggle_important_commands(
                 context.board,
                 std::slice::from_ref(&id),
             ));
@@ -641,6 +682,25 @@ impl BoardView {
             .then_some(id)
     }
 
+    /// The note whose "!" slot is under the pointer.
+    fn important_slot_at(
+        &self,
+        geometry: &Geometry,
+        context: &BoardContext<'_>,
+        pointer: Pos2,
+        canvas_rect: Rect,
+    ) -> Option<NoteId> {
+        let id = self.hit_note(geometry, context, pointer, canvas_rect)?;
+        if context.board.note(&id).is_some_and(|note| note.inbox) {
+            return None;
+        }
+        let screen = geometry.screen_rect(&id, &self.camera, canvas_rect)?;
+        important_rect(header_rect(screen, self.camera.zoom), self.camera.zoom)
+            .expand(2.0)
+            .contains(pointer)
+            .then_some(id)
+    }
+
     /// The note whose link handle is under the pointer (single selection only).
     fn link_handle_at(
         &self,
@@ -732,6 +792,27 @@ impl BoardView {
             return;
         }
 
+        let shift_ctrl = Modifiers::COMMAND | Modifiers::SHIFT;
+        let (ungroup, group, important) = ctx.input_mut(|input| {
+            (
+                input.consume_key(shift_ctrl, Key::G),
+                input.consume_key(Modifiers::COMMAND, Key::G),
+                input.consume_key(Modifiers::COMMAND, Key::I),
+            )
+        });
+        if group {
+            self.group_selection(context.board, output);
+        }
+        if ungroup {
+            output
+                .commands
+                .extend(ungroup_commands(context.board, &self.selected));
+        }
+        if important {
+            output
+                .commands
+                .extend(toggle_important_commands(context.board, &self.selected));
+        }
         let (escape, delete, enter, select_all, toggle_done) = ctx.input_mut(|input| {
             let escape = !self.selected.is_empty() || !self.selected_edges.is_empty();
             let escape = escape && input.consume_key(Modifiers::NONE, Key::Escape);
@@ -770,6 +851,31 @@ impl BoardView {
                 .collect();
             self.selected_edges.clear();
         }
+    }
+
+    /// Ctrl+G: wrap the selection (minus the Inbox and descendants of other
+    /// selected notes) in a new container and open its title for editing.
+    fn group_selection(&mut self, board: &Board, output: &mut BoardOutput) {
+        let ids: Vec<NoteId> = self
+            .selected
+            .iter()
+            .filter(|id| board.note(id).is_some_and(|note| !note.inbox))
+            .filter(|id| {
+                !self
+                    .selected
+                    .iter()
+                    .any(|other| other != *id && is_ancestor_or_self(board, other, id))
+            })
+            .cloned()
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        output.commands.push(Command::Wrap {
+            ids,
+            text: String::new(),
+        });
+        output.edit_new_note = true;
     }
 
     fn editor_id(&self, ui: &Ui) -> Option<egui::Id> {
@@ -830,6 +936,29 @@ impl BoardView {
         best.map(|(_, id)| id)
     }
 
+    /// The notes a drag moves: the whole selection when the pressed note is
+    /// part of it, otherwise just that note. Descendants of other moved notes
+    /// are dropped because they travel with their ancestor.
+    fn dragged_notes(&self, board: &Board) -> Vec<NoteId> {
+        let Some(drag) = &self.drag else {
+            return Vec::new();
+        };
+        let mut ids = if self.is_selected(&drag.id) {
+            let mut ids = vec![drag.id.clone()];
+            ids.extend(self.selected.iter().filter(|id| **id != drag.id).cloned());
+            ids
+        } else {
+            vec![drag.id.clone()]
+        };
+        ids.retain(|id| board.note(id).is_some());
+        let all = ids.clone();
+        ids.retain(|id| {
+            !all.iter()
+                .any(|other| other != id && is_ancestor_or_self(board, other, id))
+        });
+        ids
+    }
+
     /// Commit a note drag at the given world position. Used by the release
     /// handler and by the interaction tests.
     fn commit_note_drop(
@@ -841,22 +970,9 @@ impl BoardView {
         let Some(drag) = self.drag.clone() else {
             return Vec::new();
         };
-        let Some(note) = board.note(&drag.id) else {
-            return Vec::new();
-        };
-        if note.parent.is_none() {
-            return vec![Command::Pin {
-                id: drag.id,
-                x: drop_world.x - drag.grab.x,
-                y: drop_world.y - drag.grab.y,
-            }];
-        }
-        let target = geometry.drop_target(board, &drag.id, drop_world, &geometry.world_rects());
-        vec![Command::SetParent {
-            id: drag.id,
-            parent: target,
-            before: None,
-        }]
+        let dragged = self.dragged_notes(board);
+        let plan = plan_drop(board, geometry, &dragged, drop_world, drag.grab);
+        drop_commands(board, geometry, &dragged, &plan)
     }
 
     fn paint_notes(
@@ -905,25 +1021,32 @@ impl BoardView {
             };
             let padding = (theme::NOTE_PADDING * self.camera.zoom).max(2.0);
             let checkbox = checkbox_rect(header, self.camera.zoom);
-            let mut title_left = if note.inbox {
+            let title_left = if note.inbox {
                 screen.left() + padding
             } else {
                 paint_checkbox(painter, checkbox, done, palette.ink, opacity);
                 checkbox.right() + padding * 0.75
             };
-            if note.important {
-                let galley = painter.layout_no_wrap(
-                    "!".to_owned(),
-                    FontId::proportional(title_font * 1.15),
-                    dim(theme::IMPORTANT, opacity),
+            let bang = important_rect(header, self.camera.zoom);
+            let bang_hovered = ui
+                .input(|input| input.pointer.hover_pos())
+                .is_some_and(|pointer| bang.expand(2.0).contains(pointer));
+            if !note.inbox && (note.important || bang_hovered) {
+                let color = if note.important {
+                    dim(theme::IMPORTANT, opacity)
+                } else {
+                    dim(theme::IMPORTANT, opacity * 0.35)
+                };
+                painter.text(
+                    bang.center(),
+                    Align2::CENTER_CENTER,
+                    "!",
+                    FontId::proportional((title_font * 1.25).max(4.0)),
+                    color,
                 );
-                let size = galley.size();
-                painter.galley(
-                    pos2(title_left, header.center().y - size.y * 0.5),
-                    galley,
-                    Color32::TRANSPARENT,
-                );
-                title_left += size.x + padding * 0.5;
+            }
+            if bang_hovered && !note.inbox {
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
             }
             let progress = container
                 .then(|| child_progress(context.board, &note.id))
@@ -937,7 +1060,7 @@ impl BoardView {
                 let width = galley.size().x;
                 painter.galley(
                     pos2(
-                        header.right() - padding - width,
+                        bang.left() - padding * 0.5 - width,
                         header.center().y - galley.size().y * 0.5,
                     ),
                     galley,
@@ -948,7 +1071,7 @@ impl BoardView {
                 0.0
             };
             let label = if title.is_empty() { "Untitled" } else { title };
-            let max_width = (header.right() - padding - progress_width - title_left).max(0.0);
+            let max_width = (bang.left() - padding * 0.5 - progress_width - title_left).max(0.0);
             let galley = painter.layout(
                 label.to_owned(),
                 FontId::proportional(title_font),
@@ -1079,6 +1202,22 @@ impl BoardView {
                 .extend(toggle_done_commands(context.board, targets));
             ui.close();
         }
+        if !protected {
+            let all_important = targets
+                .iter()
+                .all(|id| context.board.note(id).is_some_and(|note| note.important));
+            let label = if all_important {
+                "Not important"
+            } else {
+                "Mark important"
+            };
+            if ui.button(label).on_hover_text("Ctrl+I").clicked() {
+                output
+                    .commands
+                    .extend(toggle_important_commands(context.board, targets));
+                ui.close();
+            }
+        }
         if ui.button("Snooze 1 hour").clicked() {
             if let Some(until) = snooze_after(context.now_utc_ms, 60, context.tz) {
                 output
@@ -1115,6 +1254,42 @@ impl BoardView {
             output
                 .commands
                 .extend(snoozed.into_iter().map(|id| Command::Unsnooze { id }));
+            ui.close();
+        }
+        ui.separator();
+        let pinned: Vec<NoteId> = targets
+            .iter()
+            .filter(|id| {
+                context
+                    .board
+                    .note(id)
+                    .is_some_and(|note| note.layout == crate::model::LayoutMode::Pinned)
+            })
+            .cloned()
+            .collect();
+        if !pinned.is_empty() && ui.button("Unpin (back to the row)").clicked() {
+            output
+                .commands
+                .extend(pinned.into_iter().map(|id| Command::Unpin { id }));
+            ui.close();
+        }
+        if !protected
+            && ui
+                .button("Group into a container")
+                .on_hover_text("Ctrl+G")
+                .clicked()
+        {
+            self.selected = targets.to_vec();
+            self.group_selection(context.board, output);
+            ui.close();
+        }
+        let has_children = targets.iter().any(|id| {
+            context.board.has_children(id) && !context.board.note(id).is_some_and(|n| n.inbox)
+        });
+        if has_children && ui.button("Ungroup").on_hover_text("Ctrl+Shift+G").clicked() {
+            output
+                .commands
+                .extend(ungroup_commands(context.board, targets));
             ui.close();
         }
         if protected {
@@ -1164,19 +1339,33 @@ impl BoardView {
             return;
         };
         let painter = ui.painter_at(canvas_rect);
-        if let Some(target) = &self.drop_target
-            && let Some(rect) = geometry.screen_rect(target, &self.camera, canvas_rect)
-        {
-            painter.rect_stroke(
-                rect.expand(3.0),
-                theme::CARD_CORNER,
-                Stroke::new(2.0, theme::ACCENT),
-                StrokeKind::Outside,
-            );
+        match &self.drop_plan {
+            Some(DropPlan::Nest { target }) => {
+                if let Some(rect) = geometry.screen_rect(target, &self.camera, canvas_rect) {
+                    painter.rect_stroke(
+                        rect.expand(3.0),
+                        theme::CARD_CORNER,
+                        Stroke::new(2.0, theme::ACCENT),
+                        StrokeKind::Outside,
+                    );
+                }
+            }
+            Some(DropPlan::Place { marker, after, .. }) => {
+                if let Some(rect) = geometry.screen_rect(marker, &self.camera, canvas_rect) {
+                    let x = if *after {
+                        rect.right() + 4.0
+                    } else {
+                        rect.left() - 4.0
+                    };
+                    painter.vline(x, rect.y_range(), Stroke::new(3.0, theme::ACCENT));
+                }
+            }
+            Some(DropPlan::Pin { .. }) | None => {}
         }
         if let Some(source) = geometry.screen_rect(&drag.id, &self.camera, canvas_rect) {
+            let grab = drag.grab * self.camera.zoom;
             painter.rect_stroke(
-                Rect::from_min_size(pointer, source.size()),
+                Rect::from_min_size(pointer - grab, source.size()),
                 theme::CARD_CORNER,
                 Stroke::new(1.0, theme::ACCENT),
                 StrokeKind::Outside,
@@ -1285,30 +1474,159 @@ impl Geometry {
         self.num(id)
             .is_some_and(|number| self.layout.containers.contains(&number))
     }
+}
 
-    /// The smallest note under the pointer that can accept this drop.
-    fn drop_target(
-        &self,
-        board: &Board,
-        dragged: &str,
-        world: Pos2,
-        rects: &HashMap<NoteId, Rect>,
-    ) -> Option<NoteId> {
-        let mut candidates: Vec<(&NoteId, &Rect)> = rects
-            .iter()
-            .filter(|(id, rect)| {
-                *id != dragged && rect.contains(world) && !is_ancestor_or_self(board, dragged, id)
-            })
-            .collect();
-        candidates.sort_by(|left, right| {
-            let left_area = left.1.width() * left.1.height();
-            let right_area = right.1.width() * right.1.height();
-            left_area
-                .partial_cmp(&right_area)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        candidates.first().map(|(id, _)| (*id).clone())
+/// Siblings in the order the layout shows them: open before done, important
+/// first, then sort order and id.
+fn display_children<'a>(board: &'a Board, parent: Option<&str>) -> Vec<&'a Note> {
+    let mut children = board.children(parent);
+    children.sort_by_key(|note| {
+        (
+            note.status == Status::Done,
+            !note.important,
+            note.sort,
+            note.id.clone(),
+        )
+    });
+    children
+}
+
+/// Decide where a drag of `dragged` lands when released at `world`.
+///
+/// * over a leaf's left or right quarter: insert before or after it;
+/// * over the rest of a note (or a container's own frame): nest inside it;
+/// * over empty canvas: pin at the root.
+fn plan_drop(
+    board: &Board,
+    geometry: &Geometry,
+    dragged: &[NoteId],
+    world: Pos2,
+    grab: Vec2,
+) -> DropPlan {
+    let pin = DropPlan::Pin {
+        x: world.x - grab.x,
+        y: world.y - grab.y,
+    };
+    let rects = geometry.world_rects();
+    let mut candidates: Vec<(&NoteId, &Rect)> = rects
+        .iter()
+        .filter(|(id, rect)| {
+            rect.contains(world)
+                && !dragged
+                    .iter()
+                    .any(|moved| is_ancestor_or_self(board, moved, id))
+        })
+        .collect();
+    candidates.sort_by(|left, right| {
+        let left_area = left.1.width() * left.1.height();
+        let right_area = right.1.width() * right.1.height();
+        left_area
+            .partial_cmp(&right_area)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let Some((target, rect)) = candidates.first().map(|(id, rect)| ((*id).clone(), **rect)) else {
+        return pin;
+    };
+    let Some(note) = board.note(&target) else {
+        return pin;
+    };
+    let pinned_root = note.parent.is_none() && note.layout == crate::model::LayoutMode::Pinned;
+    let edge_zone = !geometry.is_container(&target) && !note.inbox && !pinned_root;
+    if edge_zone {
+        let fraction = (world.x - rect.left()) / rect.width().max(1.0);
+        if fraction < 0.25 || fraction > 0.75 {
+            let after = fraction > 0.75;
+            let before = if after {
+                let siblings: Vec<&Note> = display_children(board, note.parent.as_deref())
+                    .into_iter()
+                    .filter(|sibling| !dragged.contains(&sibling.id))
+                    .collect();
+                siblings
+                    .iter()
+                    .position(|sibling| sibling.id == target)
+                    .and_then(|index| siblings.get(index + 1))
+                    .map(|sibling| sibling.id.clone())
+            } else {
+                Some(target.clone())
+            };
+            return DropPlan::Place {
+                parent: note.parent.clone(),
+                before,
+                marker: target,
+                after,
+            };
+        }
     }
+    DropPlan::Nest { target }
+}
+
+/// The commands that carry out a drop plan for the dragged notes.
+fn drop_commands(
+    board: &Board,
+    geometry: &Geometry,
+    dragged: &[NoteId],
+    plan: &DropPlan,
+) -> Vec<Command> {
+    let mut commands = Vec::new();
+    match plan {
+        DropPlan::Nest { target } => {
+            for id in dragged {
+                if board.note(id).is_some_and(|note| !note.inbox) {
+                    commands.push(Command::SetParent {
+                        id: id.clone(),
+                        parent: Some(target.clone()),
+                        before: None,
+                    });
+                }
+            }
+        }
+        DropPlan::Place { parent, before, .. } => {
+            for id in dragged {
+                let Some(note) = board.note(id) else {
+                    continue;
+                };
+                if note.inbox && parent.is_some() {
+                    continue;
+                }
+                if note.parent.is_none()
+                    && parent.is_none()
+                    && note.layout == crate::model::LayoutMode::Pinned
+                {
+                    commands.push(Command::Unpin { id: id.clone() });
+                }
+                commands.push(Command::SetParent {
+                    id: id.clone(),
+                    parent: parent.clone(),
+                    before: before.clone(),
+                });
+            }
+        }
+        DropPlan::Pin { x, y } => {
+            let anchor = dragged.first().and_then(|id| geometry.world_rect(id));
+            for id in dragged {
+                let Some(note) = board.note(id) else {
+                    continue;
+                };
+                let offset = match (anchor, geometry.world_rect(id)) {
+                    (Some(anchor), Some(rect)) => rect.min - anchor.min,
+                    _ => Vec2::ZERO,
+                };
+                if note.parent.is_some() {
+                    commands.push(Command::SetParent {
+                        id: id.clone(),
+                        parent: None,
+                        before: None,
+                    });
+                }
+                commands.push(Command::Pin {
+                    id: id.clone(),
+                    x: x + offset.x,
+                    y: y + offset.y,
+                });
+            }
+        }
+    }
+    commands
 }
 
 /// Done notes with no open descendants: the set "Hide done" removes.
@@ -1607,6 +1925,19 @@ fn header_rect(screen: Rect, zoom: f32) -> Rect {
     Rect::from_min_size(screen.min, vec2(screen.width(), height))
 }
 
+/// The importance slot ("!") at the right of a header.
+fn important_rect(header: Rect, zoom: f32) -> Rect {
+    let side = (CHECKBOX_SIZE * zoom).clamp(6.0, header.height() * 0.8);
+    let padding = (theme::NOTE_PADDING * zoom).max(2.0);
+    Rect::from_min_size(
+        pos2(
+            header.right() - padding - side,
+            header.center().y - side * 0.5,
+        ),
+        vec2(side, side),
+    )
+}
+
 /// The done checkbox at the left of a header.
 fn checkbox_rect(header: Rect, zoom: f32) -> Rect {
     let side = (CHECKBOX_SIZE * zoom).clamp(6.0, header.height() * 0.8);
@@ -1651,6 +1982,50 @@ fn child_progress(board: &Board, id: &str) -> Option<(usize, usize)> {
         (done + usize::from(note.status == Status::Done), total + 1)
     });
     (total > 0).then_some((done, total))
+}
+
+/// Ctrl+Shift+G: move each selected container's children to its parent, in
+/// its place, then delete the empty container. The Inbox is never ungrouped.
+fn ungroup_commands(board: &Board, targets: &[NoteId]) -> Vec<Command> {
+    let mut commands = Vec::new();
+    for id in targets {
+        let Some(container) = board.note(id) else {
+            continue;
+        };
+        if container.inbox {
+            continue;
+        }
+        let children = display_children(board, Some(id));
+        if children.is_empty() {
+            continue;
+        }
+        if container.parent.is_none() && container.layout == crate::model::LayoutMode::Pinned {
+            commands.push(Command::Unpin { id: id.clone() });
+        }
+        for child in children {
+            commands.push(Command::SetParent {
+                id: child.id.clone(),
+                parent: container.parent.clone(),
+                before: Some(id.clone()),
+            });
+        }
+        commands.push(Command::Delete { id: id.clone() });
+    }
+    commands
+}
+
+/// Mark every target important, or clear the flag when all already have it.
+fn toggle_important_commands(board: &Board, targets: &[NoteId]) -> Vec<Command> {
+    let notes: Vec<&Note> = targets.iter().filter_map(|id| board.note(id)).collect();
+    let important = !notes.iter().all(|note| note.important);
+    notes
+        .iter()
+        .filter(|note| note.important != important)
+        .map(|note| Command::SetImportant {
+            id: note.id.clone(),
+            important,
+        })
+        .collect()
 }
 
 /// Complete every open target, or reopen them all when every target is done.
@@ -2074,6 +2449,127 @@ mod tests {
         assert!(geometry.world_rect(&child).is_some());
         let shown = Geometry::build(&board, 0, false);
         assert!(shown.world_rect(&root).is_some());
+    }
+
+    #[test]
+    fn drop_zones_reorder_at_the_edges_and_nest_in_the_middle() {
+        let mut store = store("board-drop-zones");
+        let (_, first) = board_and_root(&mut store);
+        let second = add_note(&mut store, "second", None);
+        let third = add_note(&mut store, "third", None);
+        let board = Board::load(store.connection()).expect("load");
+        let geometry = Geometry::build(&board, 0, false);
+        let rects = geometry.world_rects();
+        let target = rects[&first];
+        let dragged = vec![third.clone()];
+
+        let left = pos2(target.left() + target.width() * 0.1, target.center().y);
+        assert_eq!(
+            plan_drop(&board, &geometry, &dragged, left, Vec2::ZERO),
+            DropPlan::Place {
+                parent: None,
+                before: Some(first.clone()),
+                marker: first.clone(),
+                after: false,
+            }
+        );
+        let right = pos2(target.left() + target.width() * 0.9, target.center().y);
+        assert!(matches!(
+            plan_drop(&board, &geometry, &dragged, right, Vec2::ZERO),
+            DropPlan::Place { before: Some(ref before), after: true, .. } if *before == second
+        ));
+        assert_eq!(
+            plan_drop(&board, &geometry, &dragged, target.center(), Vec2::ZERO),
+            DropPlan::Nest {
+                target: first.clone()
+            }
+        );
+        assert!(matches!(
+            plan_drop(
+                &board,
+                &geometry,
+                &dragged,
+                pos2(-500.0, -500.0),
+                Vec2::ZERO
+            ),
+            DropPlan::Pin { .. }
+        ));
+    }
+
+    #[test]
+    fn a_multi_selection_drag_moves_every_selected_note() {
+        let mut store = store("board-multi-drag");
+        let (_, target) = board_and_root(&mut store);
+        let a = add_note(&mut store, "a", None);
+        let b = add_note(&mut store, "b", None);
+        let board = Board::load(store.connection()).expect("load");
+        let geometry = Geometry::build(&board, 0, false);
+        let rects = geometry.world_rects();
+        let mut view = BoardView::new();
+        view.selected = vec![a.clone(), b.clone()];
+        view.drag = Some(NoteDrag {
+            id: a.clone(),
+            grab: Vec2::ZERO,
+            moved: true,
+            reselect: false,
+        });
+        let commands = view.commit_note_drop(&board, &geometry, rects[&target].center());
+        let moved: Vec<&str> = commands
+            .iter()
+            .filter_map(|command| match command {
+                Command::SetParent {
+                    id,
+                    parent: Some(parent),
+                    ..
+                } if *parent == target => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(moved, vec![a.as_str(), b.as_str()]);
+    }
+
+    #[test]
+    fn ungroup_lifts_children_into_the_containers_place_and_deletes_it() {
+        let mut store = store("board-ungroup");
+        let (_, container) = board_and_root(&mut store);
+        let kid = add_note(&mut store, "kid", Some(&container));
+        let board = Board::load(store.connection()).expect("load");
+        let commands = ungroup_commands(&board, std::slice::from_ref(&container));
+        assert!(matches!(
+            commands.as_slice(),
+            [
+                Command::SetParent { id, parent: None, before: Some(before) },
+                Command::Delete { id: deleted },
+            ] if *id == kid && *before == container && *deleted == container
+        ));
+        store
+            .apply(&commands, crate::command::Actor::Human, None)
+            .expect("ungroup applies");
+        let board = Board::load(store.connection()).expect("load");
+        assert!(board.note(&container).is_none());
+        assert_eq!(board.note(&kid).expect("kid").parent, None);
+    }
+
+    #[test]
+    fn toggle_important_sets_all_or_clears_all() {
+        let mut store = store("board-important");
+        let (_, a) = board_and_root(&mut store);
+        let b = add_note(&mut store, "b", None);
+        let board = Board::load(store.connection()).expect("load");
+        let set = toggle_important_commands(&board, &[a.clone(), b.clone()]);
+        assert_eq!(set.len(), 2);
+        store
+            .apply(&set, crate::command::Actor::Human, None)
+            .expect("apply");
+        let board = Board::load(store.connection()).expect("load");
+        let clear = toggle_important_commands(&board, &[a.clone(), b.clone()]);
+        assert!(clear.iter().all(|command| matches!(
+            command,
+            Command::SetImportant {
+                important: false,
+                ..
+            }
+        )));
     }
 
     #[test]

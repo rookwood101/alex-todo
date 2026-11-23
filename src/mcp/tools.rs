@@ -244,6 +244,14 @@ impl JsonSchema for Command {
             &["id", "important"],
         ));
         one_of.push(command_variant(
+            "wrap",
+            &[
+                ("ids", json!({"type": "array", "items": {"type": "string"}, "description": "Notes to wrap; the new container takes the first note's place"})),
+                ("text", json!({"type": "string", "description": "Container title"})),
+            ],
+            &["ids"],
+        ));
+        one_of.push(command_variant(
             "set_due",
             &[("id", note_id()), ("due", time())],
             &["id"],
