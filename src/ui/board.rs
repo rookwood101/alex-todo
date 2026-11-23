@@ -1282,15 +1282,13 @@ impl BoardView {
             paint_card(
                 painter,
                 screen,
-                header,
                 theme::CARD_CORNER,
                 palette,
                 selected,
                 opacity,
             );
 
-            let title = first_line(&note.text);
-            let title_font = (theme::NOTE_TEXT_SIZE * self.camera.zoom * 0.9).max(4.0);
+            let label_font = (theme::NOTE_TEXT_SIZE * self.camera.zoom * 0.9).max(4.0);
             let text_color = if done {
                 dim(palette.ink, opacity * 0.45)
             } else {
@@ -1318,60 +1316,45 @@ impl BoardView {
                     bang.center(),
                     Align2::CENTER_CENTER,
                     "!",
-                    FontId::proportional((title_font * 1.25).max(4.0)),
+                    FontId::proportional((label_font * 1.25).max(4.0)),
                     color,
                 );
             }
             if bang_hovered && !note.inbox {
                 ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
             }
-            let progress = container
-                .then(|| child_progress(context.board, &note.id))
-                .flatten();
-            let progress_width = if let Some((closed, total)) = progress {
-                let galley = painter.layout_no_wrap(
-                    format!("{closed}/{total}"),
-                    FontId::proportional(title_font * 0.85),
-                    dim(palette.ink, opacity * 0.6),
-                );
-                let width = galley.size().x;
-                painter.galley(
-                    pos2(
-                        bang.left() - padding * 0.5 - width,
-                        header.center().y - galley.size().y * 0.5,
-                    ),
-                    galley,
-                    Color32::TRANSPARENT,
-                );
-                width + padding
-            } else {
-                0.0
-            };
-            let label = if title.is_empty() { "Untitled" } else { title };
-            let max_width = (bang.left() - padding * 0.5 - progress_width - title_left).max(0.0);
-            let galley = painter.layout(
-                label.to_owned(),
-                FontId::proportional(title_font),
-                text_color,
-                f32::INFINITY,
-            );
-            let title_rect = Rect::from_min_size(
-                pos2(title_left, header.center().y - galley.size().y * 0.5),
-                vec2(galley.size().x.min(max_width), galley.size().y),
-            );
-            painter
-                .with_clip_rect(title_rect.intersect(canvas_rect))
-                .galley(title_rect.min, galley, text_color);
-            if done && title_rect.width() > 0.0 {
-                painter.hline(
-                    title_rect.x_range(),
-                    title_rect.center().y,
-                    Stroke::new((1.2 * self.camera.zoom).clamp(0.6, 2.0), text_color),
-                );
-            }
 
-            if !container {
-                paint_due_chip(
+            let editing = self.editing.as_deref() == Some(note.id.as_str());
+            let (body, max_text) = if container {
+                let progress_width = match child_progress(context.board, &note.id) {
+                    Some((closed, total)) => {
+                        let galley = painter.layout_no_wrap(
+                            format!("{closed}/{total}"),
+                            FontId::proportional(label_font * 0.85),
+                            dim(palette.ink, opacity * 0.6),
+                        );
+                        let width = galley.size().x;
+                        painter.galley(
+                            pos2(
+                                bang.left() - padding * 0.5 - width,
+                                header.center().y - galley.size().y * 0.5,
+                            ),
+                            galley,
+                            Color32::TRANSPARENT,
+                        );
+                        width + padding
+                    }
+                    None => 0.0,
+                };
+                let inset = 2.0 * self.camera.zoom;
+                let right = (bang.left() - padding * 0.5 - progress_width).max(title_left);
+                let band = Rect::from_min_max(
+                    pos2(title_left, header.top() + inset),
+                    pos2(right, (header.bottom() - inset).max(header.top() + inset)),
+                );
+                (band, CONTAINER_TEXT_MAX)
+            } else {
+                let chip = paint_due_chip(
                     painter,
                     screen,
                     note,
@@ -1379,9 +1362,24 @@ impl BoardView {
                     opacity,
                     context.now_utc_ms,
                 );
-                if is_snoozed(note, context.now_utc_ms) {
+                let snoozed = is_snoozed(note, context.now_utc_ms);
+                if snoozed {
                     paint_snooze_mark(painter, screen, self.camera.zoom, opacity);
                 }
+                let rect = leaf_body_rect(screen, checkbox, chip, snoozed, self.camera.zoom);
+                (rect, BODY_TEXT_MAX)
+            };
+            if !editing {
+                paint_body_text(
+                    painter,
+                    body,
+                    &note.text,
+                    max_text,
+                    self.camera.zoom,
+                    text_color,
+                    done,
+                    canvas_rect,
+                );
             }
 
             // The card's context menu registers before the editor so the text
@@ -1400,38 +1398,28 @@ impl BoardView {
                 self.context_menu(ui, context, note, &targets, output);
             });
 
-            if self.editing.as_deref() == Some(note.id.as_str()) {
-                let bottom = if container {
-                    header.bottom() - padding * 0.5
-                } else {
-                    (screen.bottom() - padding).max(header.bottom() + padding + 4.0)
-                };
-                let top = if container {
-                    header.top() + padding * 0.5
-                } else {
-                    header.bottom() + padding
-                };
-                let editor_rect = Rect::from_min_max(
-                    pos2(screen.left() + padding, top),
-                    pos2(screen.right() - padding, bottom),
-                );
+            if editing {
+                let editor_rect = body;
                 if editor_rect.width() > 8.0 && editor_rect.height() > 8.0 {
                     let editor_id = ui.scope_id().with(("board_editor", note.id.clone()));
-                    let font_size = (theme::NOTE_TEXT_SIZE * self.camera.zoom).max(4.0);
-                    let response = ui.put(
+                    let font_size = fit_font_size(
+                        painter,
+                        &self.edit_buffer,
                         editor_rect,
-                        egui::TextEdit::multiline(&mut self.edit_buffer)
-                            .id(editor_id)
-                            .frame(egui::Frame::NONE)
-                            .background_color(if container {
-                                palette.header
-                            } else {
-                                Color32::TRANSPARENT
-                            })
-                            .text_color(palette.ink)
-                            .font(FontId::proportional(font_size))
-                            .desired_width(editor_rect.width()),
+                        max_text,
+                        self.camera.zoom,
                     );
+                    let editor = egui::TextEdit::multiline(&mut self.edit_buffer)
+                        .id(editor_id)
+                        .frame(egui::Frame::NONE)
+                        .margin(egui::Margin::ZERO)
+                        .background_color(Color32::TRANSPARENT)
+                        .text_color(palette.ink)
+                        .font(FontId::proportional(font_size))
+                        .desired_width(editor_rect.width())
+                        .align(Align2::CENTER_CENTER)
+                        .min_size(editor_rect.size());
+                    let response = ui.put(editor_rect, editor);
                     if self.focus_requested.as_deref() == Some(note.id.as_str()) {
                         response.request_focus();
                         self.focus_requested = None;
@@ -2192,7 +2180,6 @@ fn segment_distance(a: Pos2, b: Pos2, point: Pos2) -> f32 {
 fn paint_card(
     painter: &egui::Painter,
     card: Rect,
-    header: Rect,
     corner: u8,
     palette: theme::NotePalette,
     selected: bool,
@@ -2201,12 +2188,6 @@ fn paint_card(
     let shadow = Rect::from_min_size(card.min + vec2(0.0, 4.0), card.size());
     painter.rect_filled(shadow, corner, dim(theme::NOTE_SHADOW, opacity));
     painter.rect_filled(card, corner, dim(palette.fill, opacity));
-    painter.rect_filled(header, corner, dim(palette.header, opacity));
-    painter.hline(
-        card.x_range(),
-        header.bottom(),
-        Stroke::new(1.0, dim(theme::NOTE_EDGE, opacity)),
-    );
     let stroke = if selected {
         Stroke::new(2.0, dim(theme::ACCENT, opacity.max(0.6)))
     } else {
@@ -2222,13 +2203,9 @@ fn paint_due_chip(
     zoom: f32,
     opacity: f32,
     now_utc_ms: i64,
-) {
-    let Some(due) = &note.due else {
-        return;
-    };
-    let Some((label, state)) = due_label(due, now_utc_ms) else {
-        return;
-    };
+) -> Option<Rect> {
+    let due = note.due.as_ref()?;
+    let (label, state) = due_label(due, now_utc_ms)?;
     let state = if note.status == Status::Done {
         DueState::Later
     } else {
@@ -2255,6 +2232,7 @@ fn paint_due_chip(
         galley,
         Color32::TRANSPARENT,
     );
+    Some(pill)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2497,8 +2475,104 @@ fn border_point(rect: Rect, from: Pos2) -> Pos2 {
     center + direction * scale_x.min(scale_y).min(1.0)
 }
 
-fn first_line(text: &str) -> &str {
-    text.lines().next().unwrap_or("").trim()
+/// Largest sticky text size, in world units.
+const BODY_TEXT_MAX: f32 = 32.0;
+/// Largest container text size, in world units: below a sticky's text.
+const CONTAINER_TEXT_MAX: f32 = 20.0;
+/// Smallest note text size, in world units.
+const BODY_TEXT_MIN: f32 = 8.0;
+
+/// The area a sticky's body text fills: below the corner controls and above
+/// the due chip or snooze mark.
+fn leaf_body_rect(
+    card: Rect,
+    checkbox: Rect,
+    chip: Option<Rect>,
+    snoozed: bool,
+    zoom: f32,
+) -> Rect {
+    let padding = (theme::NOTE_PADDING * zoom).max(2.0);
+    let top = checkbox.bottom() + padding * 0.25;
+    let mut bottom = card.bottom() - padding;
+    if let Some(chip) = chip {
+        bottom = bottom.min(chip.top() - 2.0 * zoom);
+    }
+    if snoozed {
+        bottom = bottom.min(card.bottom() - (8.0 + 14.0) * zoom);
+    }
+    Rect::from_min_max(
+        pos2(card.left() + padding, top),
+        pos2(card.right() - padding, bottom.max(top)),
+    )
+}
+
+fn body_job(text: &str, size: f32, color: Color32, wrap_width: f32) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::simple(
+        text.to_owned(),
+        FontId::proportional(size),
+        color,
+        wrap_width,
+    );
+    job.halign = egui::Align::Center;
+    job
+}
+
+/// The largest font size (in screen points) at which `text` fits `rect`
+/// when wrapped, searched in world units so the result scales with zoom.
+fn fit_font_size(painter: &egui::Painter, text: &str, rect: Rect, max: f32, zoom: f32) -> f32 {
+    let screen = |world: f32| (world * zoom).max(1.0);
+    if text.trim().is_empty() {
+        return screen(max);
+    }
+    let fits = |world: f32| {
+        let galley =
+            painter.layout_job(body_job(text, screen(world), Color32::WHITE, rect.width()));
+        galley.size().x <= rect.width() + 0.5 && galley.size().y <= rect.height() + 0.5
+    };
+    if fits(max) {
+        return screen(max);
+    }
+    let (mut low, mut high) = (BODY_TEXT_MIN, max);
+    for _ in 0..7 {
+        let mid = (low + high) * 0.5;
+        if fits(mid) {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    screen(low)
+}
+
+/// Paint a note's whole text, centred and sized to fill `rect`.
+#[allow(clippy::too_many_arguments)]
+fn paint_body_text(
+    painter: &egui::Painter,
+    rect: Rect,
+    text: &str,
+    max: f32,
+    zoom: f32,
+    color: Color32,
+    done: bool,
+    clip: Rect,
+) {
+    if text.trim().is_empty() || rect.width() < 2.0 || rect.height() < 2.0 {
+        return;
+    }
+    let size = fit_font_size(painter, text, rect, max, zoom);
+    let galley = painter.layout_job(body_job(text, size, color, rect.width()));
+    let origin = rect.center() - galley.rect.center().to_vec2();
+    let painter = painter.with_clip_rect(rect.intersect(clip));
+    if done {
+        let stroke = Stroke::new((1.2 * zoom).clamp(0.6, 2.0), color);
+        for row in &galley.rows {
+            let row_rect = row.rect().translate(origin.to_vec2());
+            if row_rect.width() > 0.0 {
+                painter.hline(row_rect.x_range(), row_rect.center().y, stroke);
+            }
+        }
+    }
+    painter.galley(origin, galley, color);
 }
 
 /// Opacity for a note: only an active snooze dims it.
@@ -2561,6 +2635,63 @@ mod tests {
     use crate::store::{Store, StorePaths, schema, scratch_dir};
 
     const TZ: &str = "Europe/London";
+
+    /// Run `check` with a painter whose fonts are loaded.
+    fn with_painter(check: impl FnOnce(&egui::Painter)) {
+        let ctx = egui::Context::default();
+        let mut check = Some(check);
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            if let Some(check) = check.take() {
+                check(ui.painter());
+            }
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn short_sticky_text_is_large_and_long_text_shrinks_to_fit() {
+        with_painter(|painter| {
+            let rect = Rect::from_min_size(Pos2::ZERO, vec2(232.0, 110.0));
+            let short = fit_font_size(painter, "Milk", rect, BODY_TEXT_MAX, 1.0);
+            assert_eq!(short, BODY_TEXT_MAX);
+            let text = "Call the bank about the mortgage renewal and ask about \
+                        fixed rates, fees and whether overpayments are allowed";
+            let long = fit_font_size(painter, text, rect, BODY_TEXT_MAX, 1.0);
+            assert!(long < short && long >= BODY_TEXT_MIN, "{long}");
+            let galley = painter.layout_job(body_job(text, long, Color32::WHITE, rect.width()));
+            assert!(galley.size().y <= rect.height() + 0.5);
+            assert!(galley.size().x <= rect.width() + 0.5);
+        });
+    }
+
+    #[test]
+    fn container_text_tops_out_below_sticky_text() {
+        with_painter(|painter| {
+            let band = Rect::from_min_size(Pos2::ZERO, vec2(180.0, 32.0));
+            let size = fit_font_size(painter, "Work", band, CONTAINER_TEXT_MAX, 1.0);
+            assert_eq!(size, CONTAINER_TEXT_MAX);
+            let long = fit_font_size(
+                painter,
+                "Everything for the Q4 launch, including the slide deck",
+                band,
+                CONTAINER_TEXT_MAX,
+                1.0,
+            );
+            assert!((BODY_TEXT_MIN..CONTAINER_TEXT_MAX).contains(&long), "{long}");
+        });
+    }
+
+    #[test]
+    fn the_fitted_size_scales_with_zoom() {
+        with_painter(|painter| {
+            let text = "A sticky with a handful of words on it";
+            let world = Rect::from_min_size(Pos2::ZERO, vec2(232.0, 110.0));
+            let at_one = fit_font_size(painter, text, world, BODY_TEXT_MAX, 1.0);
+            let zoomed = Rect::from_min_size(Pos2::ZERO, world.size() * 2.0);
+            let at_two = fit_font_size(painter, text, zoomed, BODY_TEXT_MAX, 2.0);
+            assert!((at_two / at_one - 2.0).abs() < 0.25, "{at_one} {at_two}");
+        });
+    }
 
     fn store(name: &str) -> Store {
         let paths = StorePaths::from_home(scratch_dir(name));

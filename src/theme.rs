@@ -27,41 +27,34 @@ pub const NOTE_EDGE: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 28);
 pub const NOTE_WIDTH: f32 = 260.0;
 pub const NOTE_HEIGHT: f32 = 200.0;
 pub const NOTE_PADDING: f32 = 14.0;
-pub const NOTE_HEADER_HEIGHT: f32 = 30.0;
 pub const NOTE_TEXT_SIZE: f32 = 17.0;
 pub const CARD_CORNER: u8 = 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NotePalette {
     pub fill: Color32,
-    pub header: Color32,
     pub ink: Color32,
 }
 
 pub const NOTE_PALETTE: [NotePalette; 5] = [
     NotePalette {
         fill: Color32::from_rgb(0xf0, 0xd4, 0x86),
-        header: Color32::from_rgb(0xe6, 0xc5, 0x70),
         ink: NOTE_INK,
     },
     NotePalette {
         fill: Color32::from_rgb(0xe8, 0xa7, 0xb2),
-        header: Color32::from_rgb(0xdd, 0x94, 0xa1),
         ink: NOTE_INK,
     },
     NotePalette {
         fill: Color32::from_rgb(0x93, 0xc6, 0xe8),
-        header: Color32::from_rgb(0x81, 0xb6, 0xda),
         ink: NOTE_INK,
     },
     NotePalette {
         fill: Color32::from_rgb(0xa8, 0xd8, 0xad),
-        header: Color32::from_rgb(0x94, 0xc7, 0x9b),
         ink: NOTE_INK,
     },
     NotePalette {
         fill: Color32::from_rgb(0xba, 0xac, 0xe6),
-        header: Color32::from_rgb(0xa7, 0x99, 0xd6),
         ink: NOTE_INK,
     },
 ];
