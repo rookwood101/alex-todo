@@ -86,10 +86,20 @@ all three binaries:
 | Ctrl+N | New note in the Inbox |
 | Ctrl+Z / Ctrl+Shift+Z | Undo / redo |
 
-Capture examples: <code>buy milk tomorrow 4pm #home !</code>,
-<code>pay rent by friday</code>, <code>call #work</code>,
-<code>ship 2026-12-01 09:30</code>. A date with no time means 09:00 local; a bare time already
-past rolls to tomorrow. Ambiguous text is left alone ("the 4pm thing" stays text).
+Capture syntax (press **F1** or **?** in the composer to show or hide the help above the input;
+recognised parts are highlighted as you type):
+
+| Token | Meaning |
+|---|---|
+| <code>#home</code>, <code>#big-project</code>, <code>#work/q4</code> | Put the note in that container (created if missing; <code>-</code>/<code>_</code> match spaces; <code>/</code> nests). Typing <code>#</code> offers existing containers: ↑↓ to choose, Tab or Enter to accept |
+| <code>!</code> | Important |
+| <code>@fri 4pm</code> | Due date anywhere in the line |
+| trailing <code>tomorrow</code>, <code>fri 4pm</code>, <code>in 2h</code>, <code>in 3d</code>, <code>eod</code>, <code>tonight</code>, <code>next week</code>, <code>weekend</code>, <code>2026-12-01 09:30</code>, <code>1/12</code> | Due date at the end of the line, no <code>@</code> needed |
+
+Examples: <code>buy milk #home @tomorrow</code>, <code>call bob @fri 4pm about the invoice</code>,
+<code>send report eod #work !</code>. A date with no time means 09:00 local (tonight 19:00, eod 17:00,
+weekend Saturday 10:00); a bare time already past rolls to tomorrow. A mid-line time without
+<code>@</code> stays text ("the 4pm thing").
 
 ## Agent modes
 

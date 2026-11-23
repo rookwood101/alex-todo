@@ -186,6 +186,7 @@ impl RustboardApp {
             pending_new_note: false,
             full,
         };
+        app.composer.set_help_visible(app.config.show_syntax_help);
         if full {
             app.start_notifications();
         }
@@ -567,6 +568,12 @@ impl RustboardApp {
             && let Some(id) = applied.new_ids.notes.first().cloned()
         {
             self.view.reveal(id);
+        }
+        if let Some(visible) = composer_output.help_toggled {
+            self.config.show_syntax_help = visible;
+            if let Err(error) = self.config.save(Config::path_for(&self.paths)) {
+                self.set_status(format!("Cannot save settings: {error}"), true);
+            }
         }
         if let Some(prompt) = composer_output.agent_prompt {
             self.send_prompt(prompt);

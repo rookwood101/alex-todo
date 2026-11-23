@@ -54,6 +54,8 @@ pub struct Config {
     pub reminder_minutes: u64,
     /// Hide done notes that have no open descendants.
     pub hide_done: bool,
+    /// Show the capture syntax help above the focused composer.
+    pub show_syntax_help: bool,
 }
 
 impl Default for Config {
@@ -67,6 +69,7 @@ impl Default for Config {
             pi_profile: Profile::Board,
             reminder_minutes: 30,
             hide_done: false,
+            show_syntax_help: true,
         }
     }
 }
