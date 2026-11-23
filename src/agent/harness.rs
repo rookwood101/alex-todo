@@ -77,6 +77,22 @@ impl PiHarness {
         self.shared.set_log(path).map_err(AgentError::Io)
     }
 
+    /// Switch the session's model. Never starts a child.
+    pub fn set_model(&self, provider: &str, model_id: &str) -> Result<(), AgentError> {
+        let _lifecycle = lock(&self.lifecycle);
+        let id = command_id();
+        self.shared.register_pending(&id, "set_model");
+        let record = json!({
+            "id": id,
+            "type": "set_model",
+            "provider": provider,
+            "modelId": model_id,
+        });
+        self.write_running(&record).inspect_err(|_| {
+            let _ = self.shared.take_pending(&id);
+        })
+    }
+
     /// Start a fresh conversation: tell a running Pi, or make the next spawn
     /// skip `--continue`.
     pub fn new_session(&self) -> Result<(), AgentError> {
@@ -273,11 +289,16 @@ impl PiHarness {
                 lock(&self.inner).process = Some(process);
                 self.shared.set_status(AgentStatus::Ready);
                 self.shared.emit(AgentEvent::Ready);
+                // Ask for the current model, the model list and (with a
+                // session folder) the resumed conversation.
+                let mut queries = vec!["get_state", "get_available_models"];
                 if self.config.session_dir.is_some() {
-                    // Ask for the resumed conversation so the UI can show it.
+                    queries.push("get_messages");
+                }
+                for query in queries {
                     let id = command_id();
-                    self.shared.register_pending(&id, "get_messages");
-                    let _ = self.write_running(&json!({"id": id, "type": "get_messages"}));
+                    self.shared.register_pending(&id, query);
+                    let _ = self.write_running(&json!({"id": id, "type": query}));
                 }
                 Ok(())
             }
@@ -327,6 +348,10 @@ impl AgentHarness for PiHarness {
 
     fn new_session(&self) -> Result<(), AgentError> {
         PiHarness::new_session(self)
+    }
+
+    fn set_model(&self, provider: &str, id: &str) -> Result<(), AgentError> {
+        PiHarness::set_model(self, provider, id)
     }
 
     fn status(&self) -> AgentStatus {

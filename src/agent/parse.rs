@@ -9,7 +9,20 @@ use std::collections::{HashMap, HashSet};
 use serde_json::Value;
 
 use super::shared::Shared;
-use super::{AgentEvent, HistoryMessage};
+use super::{AgentEvent, HistoryMessage, ModelChoice};
+
+/// A Pi Model object ({provider, id, name, ...}).
+fn model_choice(value: &Value) -> Option<ModelChoice> {
+    let provider = value.get("provider").and_then(Value::as_str)?.to_owned();
+    let id = value.get("id").and_then(Value::as_str)?.to_owned();
+    let name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(&id)
+        .to_owned();
+    Some(ModelChoice { provider, id, name })
+}
 
 /// User and assistant text from Pi's `get_messages` AgentMessage list.
 fn history_messages(messages: &[Value]) -> Vec<HistoryMessage> {
@@ -207,13 +220,41 @@ impl ParserState {
             .or(pending)
             .unwrap_or_else(|| "command".to_owned());
         if success {
-            if command == "get_messages"
-                && let Some(messages) = record
-                    .get("data")
-                    .and_then(|data| data.get("messages"))
-                    .and_then(Value::as_array)
-            {
-                events.push(AgentEvent::History(history_messages(messages)));
+            let data = record.get("data");
+            match command.as_str() {
+                "get_messages" => {
+                    if let Some(messages) = data
+                        .and_then(|data| data.get("messages"))
+                        .and_then(Value::as_array)
+                    {
+                        events.push(AgentEvent::History(history_messages(messages)));
+                    }
+                }
+                "get_available_models" => {
+                    if let Some(models) = data
+                        .and_then(|data| data.get("models"))
+                        .and_then(Value::as_array)
+                    {
+                        events.push(AgentEvent::Models(
+                            models.iter().filter_map(model_choice).collect(),
+                        ));
+                    }
+                }
+                "get_state" => {
+                    let model = data
+                        .and_then(|data| data.get("model"))
+                        .and_then(model_choice);
+                    events.push(AgentEvent::CurrentModel(model));
+                }
+                "set_model" => {
+                    let model = data.and_then(|data| {
+                        model_choice(data).or_else(|| data.get("model").and_then(model_choice))
+                    });
+                    if model.is_some() {
+                        events.push(AgentEvent::CurrentModel(model));
+                    }
+                }
+                _ => {}
             }
             return;
         }
@@ -423,6 +464,47 @@ mod tests {
     fn shared() -> Shared {
         let (sender, _receiver) = crossbeam_channel::unbounded();
         Shared::new(sender)
+    }
+
+    #[test]
+    fn model_responses_become_model_events() {
+        let shared = shared();
+        let mut parser = ParserState::default();
+        let models = parser.parse_line(
+            br#"{"id":"m1","type":"response","command":"get_available_models","success":true,"data":{"models":[{"provider":"google-vertex","id":"gemini-4-carbon","name":"Gemini 4 Carbon"},{"provider":"google-vertex","id":"gemini-3.8-flash"}]}}"#,
+            &shared,
+        );
+        assert_eq!(
+            models,
+            vec![AgentEvent::Models(vec![
+                ModelChoice {
+                    provider: "google-vertex".to_owned(),
+                    id: "gemini-4-carbon".to_owned(),
+                    name: "Gemini 4 Carbon".to_owned()
+                },
+                ModelChoice {
+                    provider: "google-vertex".to_owned(),
+                    id: "gemini-3.8-flash".to_owned(),
+                    name: "gemini-3.8-flash".to_owned()
+                },
+            ])]
+        );
+        let state = parser.parse_line(
+            br#"{"id":"s1","type":"response","command":"get_state","success":true,"data":{"model":{"provider":"google-vertex","id":"gemini-4-carbon"}}}"#,
+            &shared,
+        );
+        assert!(matches!(
+            state.as_slice(),
+            [AgentEvent::CurrentModel(Some(model))] if model.id == "gemini-4-carbon"
+        ));
+        let changed = parser.parse_line(
+            br#"{"id":"x","type":"response","command":"set_model","success":true,"data":{"provider":"google-vertex","id":"gemini-3.8-flash"}}"#,
+            &shared,
+        );
+        assert!(matches!(
+            changed.as_slice(),
+            [AgentEvent::CurrentModel(Some(model))] if model.id == "gemini-3.8-flash"
+        ));
     }
 
     #[test]

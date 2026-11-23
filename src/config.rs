@@ -44,10 +44,6 @@ pub struct Config {
     pub board_db: Option<PathBuf>,
     /// IANA zone for new deadlines; None means the system zone.
     pub tz: Option<String>,
-    /// Pi model id.
-    pub pi_model: String,
-    /// Pi provider id.
-    pub pi_provider: String,
     /// Initial tool profile.
     pub pi_profile: Profile,
     /// Reminder poll interval.
@@ -64,8 +60,6 @@ impl Default for Config {
             hotkey: "Ctrl+Space".to_owned(),
             board_db: None,
             tz: None,
-            pi_model: "deepseek-flash".to_owned(),
-            pi_provider: "deepseek".to_owned(),
             pi_profile: Profile::Board,
             reminder_minutes: 30,
             hide_done: false,
@@ -138,14 +132,6 @@ impl Config {
             self.tz = None;
         }
 
-        if self.pi_model.trim().is_empty() {
-            warnings.push("empty pi_model; using the default".to_owned());
-            self.pi_model = defaults.pi_model;
-        }
-        if self.pi_provider.trim().is_empty() {
-            warnings.push("empty pi_provider; using the default".to_owned());
-            self.pi_provider = defaults.pi_provider;
-        }
         if !(1..=1440).contains(&self.reminder_minutes) {
             warnings.push(format!(
                 "reminder_minutes {} is outside 1..=1440; clamping",
@@ -204,7 +190,6 @@ mod tests {
         assert_eq!(config, Config::default());
         assert!(warnings.is_empty());
         assert_eq!(config.hotkey, "Ctrl+Space");
-        assert_eq!(config.pi_model, "deepseek-flash");
         assert_eq!(config.reminder_minutes, 30);
     }
 
@@ -225,7 +210,10 @@ mod tests {
         )
         .expect("write config");
         let (config, warnings) = Config::load(&path);
-        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(
+            warnings.is_empty(),
+            "legacy pi_model/pi_provider keys are ignored: {warnings:?}"
+        );
         assert_eq!(config.hotkey, "Ctrl+Alt+Space");
         assert_eq!(config.pi_profile, Profile::Power);
         assert_eq!(config.reminder_minutes, 15);
@@ -258,9 +246,8 @@ mod tests {
         let (config, warnings) = Config::load(&path);
         assert_eq!(config.hotkey, "Ctrl+Space");
         assert_eq!(config.tz, None);
-        assert_eq!(config.pi_model, "deepseek-flash");
         assert_eq!(config.reminder_minutes, 1440);
-        assert_eq!(warnings.len(), 4, "{warnings:?}");
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
     }
 
     #[test]
