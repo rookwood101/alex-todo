@@ -570,6 +570,42 @@ fn ctrl_i_toggles_importance() {
 }
 
 #[test]
+fn typing_a_hash_offers_containers_and_tab_accepts() {
+    let mut headless = Headless::new("app-autocomplete");
+    headless.app.apply_commands(
+        vec![Command::AddNote {
+            text: "milk".to_owned(),
+            parent: None,
+            container: Some("Home".to_owned()),
+            at_root: false,
+            due: None,
+            remind: None,
+            important: false,
+            source: "test".to_owned(),
+        }],
+        "test",
+    );
+    headless.app.composer.request_focus();
+    headless.run_frame(Vec::new());
+    headless.run_frame(Vec::new());
+    headless.type_text("buy #ho");
+    headless.run_frame(Vec::new());
+    headless.key(Key::Tab);
+    assert_eq!(headless.app.composer.text(), "buy #Home ");
+    assert_eq!(
+        headless.app.composer.mode(),
+        crate::ui::composer::ComposerMode::Capture,
+        "Tab accepted the suggestion instead of switching mode"
+    );
+    headless.key(Key::Tab);
+    assert_eq!(
+        headless.app.composer.mode(),
+        crate::ui::composer::ComposerMode::Agent,
+        "with no suggestion open, Tab switches mode again"
+    );
+}
+
+#[test]
 fn an_invalid_config_falls_back_to_defaults() {
     let paths = StorePaths::from_home(scratch_dir("app-config"));
     std::fs::create_dir_all(paths.home()).expect("home");

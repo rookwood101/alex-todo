@@ -7,10 +7,11 @@
 //!
 //! Conservative rules, in order:
 //!
-//! * a group is only a whole token that starts with # followed by a name;
-//!   # inside a word (C#) is text;
+//! * a container is only a whole token that starts with # followed by a name
+//!   path (`#home`, `#big-project`, `#work/q4`); # inside a word (C#) is text;
 //! * importance is only a whole token: !, !important or !high;
-//! * a deadline must sit at the end of the line (after chips are removed),
+//! * a deadline starts with @ anywhere in the line (`call bob @fri 4pm about
+//!   it`), or sits at the end of the line without @ (after chips are removed),
 //!   optionally introduced by at, by, on or due; "the 4pm thing" is text;
 //! * anything ambiguous (invalid dates, 25:00, unknown words) is left alone.
 
@@ -27,6 +28,21 @@ use crate::time::TimeSpec;
 pub struct CaptureGroup {
     pub name: String,
     pub known: bool,
+}
+
+/// Which chip a consumed span belongs to (for highlighting).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MarkKind {
+    Container,
+    Important,
+    Due,
+}
+
+/// One consumed span and its chip kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Mark {
+    pub span: Span,
+    pub kind: MarkKind,
 }
 
 /// A half-open byte range in the original input that was consumed as a chip.
@@ -58,6 +74,8 @@ pub struct ParsedCapture {
     pub due: Option<TimeSpec>,
     /// Byte ranges of the original input that were consumed as chips.
     pub consumed: Vec<Span>,
+    /// The consumed ranges with their chip kind, in input order.
+    pub marks: Vec<Mark>,
 }
 
 /// Parses one capture line.
@@ -78,7 +96,7 @@ pub fn parse_capture(
         return ParsedCapture::default();
     }
 
-    let mut consumed = vec![false; tokens.len()];
+    let mut consumed: Vec<Option<MarkKind>> = vec![None; tokens.len()];
     let mut group: Option<CaptureGroup> = None;
     let mut important = false;
 
@@ -88,10 +106,10 @@ pub fn parse_capture(
                 known: false,
                 name: name.to_owned(),
             });
-            consumed[index] = true;
+            consumed[index] = Some(MarkKind::Container);
         } else if is_importance(token.text) {
             important = true;
-            consumed[index] = true;
+            consumed[index] = Some(MarkKind::Important);
         }
     }
 
@@ -104,29 +122,42 @@ pub fn parse_capture(
         found.known = true;
     }
 
-    let remaining: Vec<usize> = (0..tokens.len())
-        .filter(|index| !consumed[*index])
-        .collect();
     let mut due = None;
-    if let Some(today) = local_today(now_utc_ms, tz)
-        && let Some((used, spec)) = parse_due_suffix(&tokens, &remaining, today, now_utc_ms, tz)
-    {
-        for index in remaining.iter().rev().take(used) {
-            consumed[*index] = true;
+    if let Some(today) = local_today(now_utc_ms, tz) {
+        if let Some((start, used, spec)) = parse_at_due(&tokens, &consumed, today, now_utc_ms, tz) {
+            for slot in consumed.iter_mut().skip(start).take(used) {
+                *slot = Some(MarkKind::Due);
+            }
+            due = Some(spec);
+        } else {
+            let remaining: Vec<usize> = (0..tokens.len())
+                .filter(|index| consumed[*index].is_none())
+                .collect();
+            if let Some((used, spec)) = parse_due_suffix(&tokens, &remaining, today, now_utc_ms, tz)
+            {
+                for index in remaining.iter().rev().take(used) {
+                    consumed[*index] = Some(MarkKind::Due);
+                }
+                due = Some(spec);
+            }
         }
-        due = Some(spec);
     }
 
     let mut spans = Vec::new();
+    let mut marks = Vec::new();
     let mut parts: Vec<&str> = Vec::new();
     for (index, token) in tokens.iter().enumerate() {
-        if consumed[index] {
-            spans.push(Span::of(token));
-        } else {
-            parts.push(token.text);
+        match consumed[index] {
+            Some(kind) => {
+                spans.push(Span::of(token));
+                marks.push(Mark {
+                    span: Span::of(token),
+                    kind,
+                });
+            }
+            None => parts.push(token.text),
         }
     }
-    spans.sort_by_key(|span| span.start);
 
     ParsedCapture {
         text: parts.join(" "),
@@ -134,6 +165,7 @@ pub fn parse_capture(
         important,
         due,
         consumed: spans,
+        marks,
     }
 }
 
@@ -170,17 +202,70 @@ fn tokenize(input: &str) -> Vec<Token<'_>> {
     tokens
 }
 
-/// Group name inside a #token, if the token is a well-formed group chip.
+/// Container path inside a #token, if the token is a well-formed chip:
+/// letters, digits, "-", "_" and "/" between non-empty segments.
 fn group_name(token: &str) -> Option<&str> {
     let name = token.strip_prefix('#')?;
     if name.is_empty()
         || !name
             .chars()
-            .all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '-')
+            .all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '-' || ch == '/')
+        || name.split('/').any(str::is_empty)
     {
         return None;
     }
     Some(name)
+}
+
+/// The first "@date" phrase anywhere in the line: an @-prefixed token (or a
+/// lone "@") followed by up to four more tokens, taking the longest run that
+/// parses completely. Returns (first token index, tokens used, deadline).
+fn parse_at_due(
+    tokens: &[Token<'_>],
+    consumed: &[Option<MarkKind>],
+    today: Date,
+    now_utc_ms: i64,
+    tz: &str,
+) -> Option<(usize, usize, TimeSpec)> {
+    for (index, token) in tokens.iter().enumerate() {
+        if consumed[index].is_some() || !token.text.starts_with('@') {
+            continue;
+        }
+        let stripped = &token.text[1..];
+        let mut window: Vec<Token<'_>> = Vec::new();
+        let lone = stripped.is_empty();
+        if !lone {
+            window.push(Token {
+                text: stripped,
+                start: token.start + 1,
+                end: token.end,
+            });
+        }
+        for next in tokens.iter().skip(index + 1).take(4) {
+            window.push(Token {
+                text: next.text,
+                start: next.start,
+                end: next.end,
+            });
+        }
+        let free = consumed
+            .iter()
+            .skip(index + 1)
+            .take(window.len() - usize::from(!lone))
+            .take_while(|slot| slot.is_none())
+            .count()
+            + usize::from(!lone);
+        for length in (1..=free.min(window.len())).rev() {
+            let remaining: Vec<usize> = (0..length).collect();
+            if let Some((used, spec)) =
+                parse_due_suffix(&window[..length], &remaining, today, now_utc_ms, tz)
+                && used == length
+            {
+                return Some((index, length + usize::from(lone), spec));
+            }
+        }
+    }
+    None
 }
 
 /// A whole "!" token, or the long forms "!important" / "!high".
@@ -387,6 +472,29 @@ enum DateChoice {
     NextWeekday(Weekday),
     Exact(Date),
     PlusDays(i64),
+    /// An offset from now in minutes ("in 2h"); any clock is ignored.
+    PlusMinutes(i64),
+    /// End of the working day, 17:00 (tomorrow once it has passed).
+    Eod,
+    /// The coming Saturday, 10:00 by default.
+    Weekend,
+}
+
+/// "2h", "30m", "3d", "2w" after "in".
+fn compact_offset(token: &str) -> Option<DateChoice> {
+    let lower = token.to_ascii_lowercase();
+    let unit = lower.chars().last()?;
+    let number: i64 = lower[..lower.len() - 1].parse().ok()?;
+    if !(1..=10_000).contains(&number) {
+        return None;
+    }
+    match unit {
+        'm' => Some(DateChoice::PlusMinutes(number)),
+        'h' => Some(DateChoice::PlusMinutes(number.checked_mul(60)?)),
+        'd' => Some(DateChoice::PlusDays(number)),
+        'w' => Some(DateChoice::PlusDays(number.checked_mul(7)?)),
+        _ => None,
+    }
 }
 
 /// Parses a date at the end of the token list, returning how many tokens it
@@ -420,6 +528,47 @@ fn match_date_suffix(
     let count = remaining.len();
     if count == 0 {
         return None;
+    }
+
+    // in 2h / in 30m / in 3d / in 2w (one compact token)
+    if count >= 2
+        && tokens[remaining[count - 2]].text.eq_ignore_ascii_case("in")
+        && let Some(choice) = compact_offset(tokens[remaining[count - 1]].text)
+    {
+        return Some((2, choice));
+    }
+
+    // in N hours / in N minutes
+    if count >= 3 {
+        let unit = tokens[remaining[count - 1]].text.to_ascii_lowercase();
+        let number = tokens[remaining[count - 2]].text;
+        let prefix = tokens[remaining[count - 3]].text;
+        if prefix.eq_ignore_ascii_case("in")
+            && let Ok(amount) = number.parse::<i64>()
+            && (1..=10_000).contains(&amount)
+        {
+            match unit.as_str() {
+                "hour" | "hours" | "hr" | "hrs" => {
+                    return Some((3, DateChoice::PlusMinutes(amount.checked_mul(60)?)));
+                }
+                "minute" | "minutes" | "min" | "mins" => {
+                    return Some((3, DateChoice::PlusMinutes(amount)));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // next week (next Monday)
+    if count >= 2
+        && tokens[remaining[count - 2]]
+            .text
+            .eq_ignore_ascii_case("next")
+        && tokens[remaining[count - 1]]
+            .text
+            .eq_ignore_ascii_case("week")
+    {
+        return Some((2, DateChoice::NextWeekday(Weekday::Monday)));
     }
 
     // in N days / in N weeks
@@ -461,6 +610,21 @@ fn match_date_suffix(
     }
     if last.eq_ignore_ascii_case("tonight") {
         return Some((1, DateChoice::Tonight));
+    }
+    if last.eq_ignore_ascii_case("eod") {
+        return Some((1, DateChoice::Eod));
+    }
+    if last.eq_ignore_ascii_case("weekend") {
+        let used = if count >= 2
+            && tokens[remaining[count - 2]]
+                .text
+                .eq_ignore_ascii_case("this")
+        {
+            2
+        } else {
+            1
+        };
+        return Some((used, DateChoice::Weekend));
     }
     if let Some(weekday) = parse_weekday(last) {
         return Some((1, DateChoice::Weekday(weekday)));
@@ -525,11 +689,40 @@ fn build_due(
     roll_time_only: bool,
 ) -> Option<TimeSpec> {
     let (hour, minute) = time.unwrap_or(match choice {
-        DateChoice::Tonight => (20, 0),
+        DateChoice::Tonight => (19, 0),
+        DateChoice::Eod => (17, 0),
+        DateChoice::Weekend => (10, 0),
         _ => (9, 0),
     });
 
     match choice {
+        DateChoice::PlusMinutes(minutes) => {
+            let target = now_utc_ms.checked_add(minutes.checked_mul(60_000)?)?;
+            let zone = TimeZone::get(tz).ok()?;
+            let local = zone.to_datetime(Timestamp::from_millisecond(target).ok()?);
+            let spec = TimeSpec {
+                local: format!("{local:.0}"),
+                tz: tz.to_owned(),
+            };
+            spec.resolve().ok()?;
+            Some(spec)
+        }
+        DateChoice::Eod => {
+            let (spec, utc_ms) = resolve_on(today, hour, minute, tz)?;
+            if utc_ms <= now_utc_ms {
+                return resolve_on(add_days(today, 1)?, hour, minute, tz).map(|(spec, _)| spec);
+            }
+            Some(spec)
+        }
+        DateChoice::Weekend => {
+            let delta = weekday_delta(today.weekday(), Weekday::Saturday);
+            let candidate = add_days(today, delta)?;
+            let (spec, utc_ms) = resolve_on(candidate, hour, minute, tz)?;
+            if utc_ms > now_utc_ms {
+                return Some(spec);
+            }
+            resolve_on(add_days(candidate, 7)?, hour, minute, tz).map(|(spec, _)| spec)
+        }
         DateChoice::Today
         | DateChoice::Tomorrow
         | DateChoice::Tonight
@@ -621,6 +814,63 @@ mod tests {
     }
 
     #[test]
+    fn at_dates_work_anywhere_in_the_line() {
+        let parsed = parse("call bob @fri 4pm about the invoice");
+        assert_eq!(parsed.text, "call bob about the invoice");
+        assert_eq!(due_local(&parsed), "2026-11-27T16:00:00");
+
+        let parsed = parse("ship @tomorrow then celebrate");
+        assert_eq!(parsed.text, "ship then celebrate");
+        assert_eq!(due_local(&parsed), "2026-11-23T09:00:00");
+
+        let parsed = parse("lunch @ noon with sam");
+        assert_eq!(parsed.text, "lunch with sam");
+        assert_eq!(due_local(&parsed), "2026-11-22T12:00:00");
+
+        let parsed = parse("email @someone today");
+        assert_eq!(parsed.text, "email @someone", "an unknown @word is text");
+        assert_eq!(due_local(&parsed), "2026-11-22T09:00:00");
+
+        let parsed = parse("the 4pm thing is late");
+        assert!(parsed.due.is_none(), "a mid-line time without @ is text");
+    }
+
+    #[test]
+    fn new_relative_forms_parse() {
+        // Sunday 2026-11-22 08:00 London.
+        let cases = [
+            ("stretch in 2h", "2026-11-22T10:00:00"),
+            ("tea in 30m", "2026-11-22T08:30:00"),
+            ("call in 2 hours", "2026-11-22T10:00:00"),
+            ("renew in 3d", "2026-11-25T09:00:00"),
+            ("review in 2w", "2026-12-06T09:00:00"),
+            ("wrap up eod", "2026-11-22T17:00:00"),
+            ("plan next week", "2026-11-23T09:00:00"),
+            ("hike weekend", "2026-11-28T10:00:00"),
+            ("hike this weekend", "2026-11-28T10:00:00"),
+            ("demo tonight", "2026-11-22T19:00:00"),
+        ];
+        for (input, expected) in cases {
+            let parsed = parse(input);
+            assert_eq!(due_local(&parsed), expected, "input: {input}");
+        }
+    }
+
+    #[test]
+    fn container_paths_and_marks() {
+        let parsed = parse("plan #work/q4 ! @fri");
+        assert_eq!(parsed.text, "plan");
+        assert_eq!(parsed.group.as_ref().expect("container").name, "work/q4");
+        let kinds: Vec<MarkKind> = parsed.marks.iter().map(|mark| mark.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![MarkKind::Container, MarkKind::Important, MarkKind::Due]
+        );
+        assert!(parse("x #work/").group.is_none());
+        assert!(parse("x #/q4").group.is_none());
+    }
+
+    #[test]
     fn empty_input_is_empty() {
         let parsed = parse("");
         assert_eq!(parsed, ParsedCapture::default());
@@ -684,7 +934,7 @@ mod tests {
         let cases = [
             ("buy milk today", "buy milk", "2026-11-22T09:00:00"),
             ("buy milk tomorrow", "buy milk", "2026-11-23T09:00:00"),
-            ("buy milk tonight", "buy milk", "2026-11-22T20:00:00"),
+            ("buy milk tonight", "buy milk", "2026-11-22T19:00:00"),
             ("pay in 3 days", "pay", "2026-11-25T09:00:00"),
             ("pay in 2 weeks", "pay", "2026-12-06T09:00:00"),
             ("ship 2026-12-01", "ship", "2026-12-01T09:00:00"),
