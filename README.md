@@ -197,7 +197,6 @@ and undo.
 | <code>src/mcp/</code> | MCP tools, server and the <code>board_sql</code> authorizer |
 | <code>src/remind.rs</code>, <code>src/notify.rs</code>, <code>src/platform/</code> | Reminders, toasts, tray/hotkey |
 | <code>src/bin/todo.rs</code>, <code>src/bin/rustboard-mcp.rs</code> | CLI and MCP binaries |
-| <code>docs/tasks/</code> | The v2 task briefs and implementation notes |
 | <code>scripts/build.ps1</code> | Release build and signing for all three binaries |
 
 ## License
