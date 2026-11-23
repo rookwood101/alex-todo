@@ -76,7 +76,8 @@ all three binaries:
 | Drag a note (or the selection) | Drop on a note's left/right edge to reorder next to it, on its middle to nest inside it, on empty canvas to pin it there |
 | Ctrl+G / Ctrl+Shift+G | Group the selection into a new container / ungroup a container |
 | Click the "!" slot / Ctrl+I | Toggle important (shown as a red "!") |
-| Drag the dot on a selected note | Link it to another note |
+| Drag the dot on a note's right edge (shown on hover) | Draw an arrow to another note |
+| Right-click an arrow | Delete the link (or select it and press Delete) |
 | Right-click a note | Edit, done/reopen, important, snooze, unpin, group/ungroup, delete (acts on the whole selection) |
 | Tab (composer) | Switch Capture / Agent |
 | Enter (composer) | Create the note / send the prompt |

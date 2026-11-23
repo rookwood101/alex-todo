@@ -606,6 +606,42 @@ fn typing_a_hash_offers_containers_and_tab_accepts() {
 }
 
 #[test]
+fn dragging_a_leaf_handle_onto_another_note_links_them() {
+    let mut headless = Headless::new("app-link-drag");
+    add_note(&mut headless.app, "from");
+    add_note(&mut headless.app, "to");
+    headless.run_frame(Vec::new());
+    let ids = headless.note_ids();
+    let (from, to) = {
+        let first = headless.note_rect(&ids[0]);
+        let second = headless.note_rect(&ids[1]);
+        if first.left() < second.left() {
+            (ids[0].clone(), ids[1].clone())
+        } else {
+            (ids[1].clone(), ids[0].clone())
+        }
+    };
+    let source = headless.note_rect(&from);
+    let handle = pos2(source.right(), source.center().y);
+    headless.drag(handle, headless.note_rect(&to).center());
+
+    let edges = &headless.app.board.edges;
+    assert_eq!(edges.len(), 1, "one arrow was created");
+    assert_eq!(edges[0].from, from);
+    assert_eq!(edges[0].to, to);
+    assert!(
+        headless
+            .app
+            .board
+            .note(&from)
+            .expect("note")
+            .parent
+            .is_none(),
+        "the handle drag did not move the note"
+    );
+}
+
+#[test]
 fn an_invalid_config_falls_back_to_defaults() {
     let paths = StorePaths::from_home(scratch_dir("app-config"));
     std::fs::create_dir_all(paths.home()).expect("home");
