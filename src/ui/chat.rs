@@ -130,6 +130,8 @@ pub struct ChatMessage {
 /// (board_sql, not mcp__rustboard__board_sql) so the chip stays small.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolChip {
+    /// Pi's toolCallId; repeated calls to one tool get their own chips.
+    pub id: String,
     /// Compact tool name.
     pub name: String,
     /// Some(true) succeeded, Some(false) failed, None still running.
@@ -280,13 +282,25 @@ impl ChatState {
         }
     }
 
-    /// Insert or update one compact tool chip.
-    fn upsert_tool_chip(&mut self, name: &str, ok: Option<bool>) {
+    /// Insert or update one tool chip, keyed by call id (or, without an id,
+    /// by the newest running chip of that name).
+    fn upsert_tool_chip(&mut self, id: &str, name: &str, ok: Option<bool>) {
         let name = compact_tool_name(name).to_owned();
-        if let Some(chip) = self.tool_chips.iter_mut().find(|chip| chip.name == name) {
-            chip.ok = ok;
+        let existing = if id.is_empty() {
+            self.tool_chips
+                .iter_mut()
+                .rev()
+                .find(|chip| chip.name == name && (ok.is_none() || chip.ok.is_none()))
         } else {
-            self.tool_chips.push(ToolChip { name, ok });
+            self.tool_chips.iter_mut().find(|chip| chip.id == id)
+        };
+        match existing {
+            Some(chip) if !(id.is_empty() && ok.is_none()) => chip.ok = ok,
+            _ => self.tool_chips.push(ToolChip {
+                id: id.to_owned(),
+                name,
+                ok,
+            }),
         }
     }
 
@@ -302,13 +316,46 @@ impl ChatState {
                     self.streaming.push_str(&delta);
                 }
             }
-            AgentEvent::ToolStart { name } => {
-                self.upsert_tool_chip(&name, None);
+            AgentEvent::TextBreak => {
+                if !self.streaming.is_empty() && !self.streaming.ends_with("\n\n") {
+                    let trimmed = self.streaming.trim_end_matches('\n').len();
+                    self.streaming.truncate(trimmed);
+                    self.streaming.push_str("\n\n");
+                }
             }
-            AgentEvent::ToolEnd { name, ok } => {
-                self.upsert_tool_chip(&name, Some(ok));
+            AgentEvent::ToolStart { id, name } => {
+                self.upsert_tool_chip(&id, &name, None);
+            }
+            AgentEvent::ToolEnd { id, name, ok } => {
+                self.upsert_tool_chip(&id, &name, Some(ok));
+            }
+            AgentEvent::History(history) => {
+                // The resumed session is the truth. Keep only a prompt that is
+                // already in flight (the lazy spawn case).
+                let in_flight = if self.busy {
+                    self.messages
+                        .last()
+                        .filter(|message| message.role == ChatRole::User)
+                        .cloned()
+                } else {
+                    None
+                };
+                self.messages = history
+                    .into_iter()
+                    .map(|message| ChatMessage {
+                        role: if message.user {
+                            ChatRole::User
+                        } else {
+                            ChatRole::Assistant
+                        },
+                        text: message.text,
+                    })
+                    .collect();
+                self.messages.extend(in_flight);
             }
             AgentEvent::TurnEnd { .. } => {
+                let trimmed = self.streaming.trim_end().len();
+                self.streaming.truncate(trimmed);
                 self.finalize_streaming();
                 self.busy = false;
             }
@@ -489,6 +536,18 @@ pub struct ChatOutput {
 /// If a turn settled since the last frame, its batch range is recorded here
 /// before the controls are drawn, which is what enables "Undo this turn".
 pub fn show(state: &mut ChatState, ctx: &egui::Context, history: &dyn TurnHistory) -> ChatOutput {
+    show_above(state, ctx, history, COMPOSER_CLEARANCE)
+}
+
+/// [show] with the panel's bottom edge `clearance` points above the window
+/// bottom (the app passes the composer's current height). An empty, idle
+/// transcript collapses to a one-line bar.
+pub fn show_above(
+    state: &mut ChatState,
+    ctx: &egui::Context,
+    history: &dyn TurnHistory,
+    clearance: f32,
+) -> ChatOutput {
     if !state.busy && state.turn_started_at_utc_ms.is_some() {
         end_turn(state, history);
     }
@@ -499,8 +558,15 @@ pub fn show(state: &mut ChatState, ctx: &egui::Context, history: &dyn TurnHistor
     let max_height = (screen.height() * MAX_HEIGHT_FRACTION).max(140.0);
     let scroll_height = (max_height - CHROME_HEIGHT).max(56.0);
 
+    let collapsed = state.messages.is_empty()
+        && state.streaming.is_empty()
+        && state.tool_chips.is_empty()
+        && state.error.is_none()
+        && state.last_turn_batches.is_empty()
+        && !state.busy;
+
     egui::Area::new(Id::unique("rustboard.chat"))
-        .anchor(Align2::CENTER_BOTTOM, vec2(0.0, -COMPOSER_CLEARANCE))
+        .anchor(Align2::CENTER_BOTTOM, vec2(0.0, -clearance))
         .order(egui::Order::Foreground)
         .fade_in(false)
         .constrain(true)
@@ -514,6 +580,10 @@ pub fn show(state: &mut ChatState, ctx: &egui::Context, history: &dyn TurnHistor
                 .inner_margin(Margin::symmetric(12, 10))
                 .show(ui, |ui| {
                     ui.set_width(width - 24.0);
+                    if collapsed {
+                        collapsed_bar(ui, state, &mut output);
+                        return;
+                    }
                     header(ui, state, &mut output);
 
                     if state.mode == ChatMode::Power {
@@ -617,6 +687,35 @@ fn header(ui: &mut egui::Ui, state: &mut ChatState, output: &mut ChatOutput) {
     });
 }
 
+/// The one-line bar shown while the transcript is empty and idle.
+fn collapsed_bar(ui: &mut egui::Ui, state: &mut ChatState, output: &mut ChatOutput) {
+    ui.horizontal(|ui| {
+        let mode_button = egui::Button::new(
+            RichText::new(format!("{} mode", state.mode.label()))
+                .size(11.0)
+                .strong()
+                .color(theme::TEXT_PRIMARY),
+        )
+        .fill(theme::ACCENT_SOFT)
+        .corner_radius(6)
+        .min_size(vec2(88.0, 22.0));
+        let response = ui
+            .add(mode_button)
+            .on_hover_text("Switch between board-only tools (Board) and OS tools (Power)");
+        #[cfg(test)]
+        test_probe::record("mode", response.rect);
+        if response.clicked() {
+            state.mode = state.mode.toggled();
+            output.mode_toggled = true;
+        }
+        ui.label(
+            RichText::new("Agent ready \u{b7} press Tab in the composer to ask")
+                .size(11.0)
+                .color(theme::TEXT_MUTED),
+        );
+    });
+}
+
 /// Warning strip shown in Power mode.
 fn power_banner(ui: &mut egui::Ui) {
     ui.add_space(6.0);
@@ -709,7 +808,7 @@ fn empty_state(ui: &mut egui::Ui, mode: ChatMode) {
     );
     let hint = match mode {
         ChatMode::Board => {
-            "Board mode: add, move, complete and schedule notes, tidy groups, and answer questions about the board."
+            "Board mode: add, move, complete and schedule notes, organise containers, and answer questions about the board."
         }
         ChatMode::Power => {
             "Power mode: board tools plus shell and file access on this machine. Keep prompts specific."
@@ -1073,12 +1172,72 @@ mod tests {
     }
 
     #[test]
+    fn text_blocks_are_separated_and_history_replaces_the_transcript() {
+        let mut harness = Harness::new();
+        harness.state.push_user_message("go");
+        begin_turn(&mut harness.state, 1);
+        harness.send_event(AgentEvent::TextBreak);
+        harness.send_event(AgentEvent::TextDelta("I'll add that.".to_owned()));
+        harness.send_event(AgentEvent::TextBreak);
+        harness.send_event(AgentEvent::TextDelta("Done.".to_owned()));
+        harness.send_event(AgentEvent::TurnEnd {
+            reason: "completed".to_owned(),
+        });
+        harness.pump();
+        assert_eq!(
+            harness.state.messages.last().map(|m| m.text.as_str()),
+            Some("I'll add that.\n\nDone.")
+        );
+
+        harness.send_event(AgentEvent::History(vec![
+            crate::agent::HistoryMessage {
+                user: true,
+                text: "earlier".to_owned(),
+            },
+            crate::agent::HistoryMessage {
+                user: false,
+                text: "reply".to_owned(),
+            },
+        ]));
+        harness.pump();
+        let texts: Vec<&str> = harness
+            .state
+            .messages
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect();
+        assert_eq!(texts, vec!["earlier", "reply"]);
+
+        harness.state.push_user_message("in flight");
+        begin_turn(&mut harness.state, 2);
+        harness.send_event(AgentEvent::History(vec![crate::agent::HistoryMessage {
+            user: true,
+            text: "earlier".to_owned(),
+        }]));
+        harness.pump();
+        let texts: Vec<&str> = harness
+            .state
+            .messages
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect();
+        assert_eq!(texts, vec!["earlier", "in flight"], "the sent prompt stays");
+    }
+
+    #[test]
     fn tool_chips_appear_update_and_fail() {
         let mut harness = Harness::new();
+        let start = |id: &str, name: &str| AgentEvent::ToolStart {
+            id: id.to_owned(),
+            name: format!("mcp__rustboard__{name}"),
+        };
+        let end = |id: &str, name: &str, ok: bool| AgentEvent::ToolEnd {
+            id: id.to_owned(),
+            name: format!("mcp__rustboard__{name}"),
+            ok,
+        };
 
-        harness.send_event(AgentEvent::ToolStart {
-            name: "mcp__rustboard__board_sql".to_owned(),
-        });
+        harness.send_event(start("c1", "board_sql"));
         assert_eq!(harness.pump(), 1);
         assert_eq!(harness.state.tool_chips.len(), 1);
         assert_eq!(harness.state.tool_chips[0].name, "board_sql");
@@ -1088,38 +1247,29 @@ mod tests {
             "board_sql \u{b7} running"
         );
 
-        harness.send_event(AgentEvent::ToolEnd {
-            name: "mcp__rustboard__board_sql".to_owned(),
-            ok: false,
-        });
+        harness.send_event(end("c1", "board_sql", false));
         assert_eq!(harness.pump(), 1);
-        assert_eq!(harness.state.tool_chips.len(), 1, "same name upserts");
+        assert_eq!(harness.state.tool_chips.len(), 1, "same id updates");
         assert_eq!(harness.state.tool_chips[0].ok, Some(false));
         assert_eq!(
             harness.state.tool_chips[0].label(),
             "board_sql \u{b7} failed"
         );
 
-        harness.send_event(AgentEvent::ToolStart {
-            name: "mcp__rustboard__add_note".to_owned(),
-        });
-        harness.send_event(AgentEvent::ToolEnd {
-            name: "mcp__rustboard__add_note".to_owned(),
-            ok: true,
-        });
-        assert_eq!(harness.pump(), 2);
-        assert_eq!(harness.state.tool_chips.len(), 2);
-        assert_eq!(harness.state.tool_chips[1].name, "add_note");
-        assert_eq!(harness.state.tool_chips[1].label(), "add_note \u{b7} ok");
+        // Two parallel calls to one tool keep separate chips.
+        harness.send_event(start("c2", "add_note"));
+        harness.send_event(start("c3", "add_note"));
+        harness.send_event(end("c2", "add_note", true));
+        assert_eq!(harness.pump(), 3);
+        assert_eq!(harness.state.tool_chips.len(), 3);
+        assert_eq!(harness.state.tool_chips[1].ok, Some(true));
+        assert_eq!(harness.state.tool_chips[2].ok, None, "c3 still runs");
 
-        // An unexpected ToolEnd updates the existing chip instead of panicking.
-        harness.send_event(AgentEvent::ToolEnd {
-            name: "mcp__rustboard__add_note".to_owned(),
-            ok: false,
-        });
+        // An unexpected ToolEnd adds a chip instead of panicking.
+        harness.send_event(end("zz", "add_note", false));
         assert_eq!(harness.pump(), 1);
-        assert_eq!(harness.state.tool_chips.len(), 2);
-        assert_eq!(harness.state.tool_chips[1].ok, Some(false));
+        assert_eq!(harness.state.tool_chips.len(), 4);
+        assert_eq!(harness.state.tool_chips[3].ok, Some(false));
 
         harness.run();
     }
@@ -1334,6 +1484,7 @@ mod tests {
         harness.state.push_user_message("keep the undo range");
         harness.state.streaming = "live".to_owned();
         harness.state.tool_chips.push(ToolChip {
+            id: "c1".to_owned(),
             name: "board_sql".to_owned(),
             ok: Some(true),
         });
@@ -1453,6 +1604,9 @@ mod tests {
         }
         assert_eq!(harness.pump(), 200);
         harness.run_with_editor(&mut text, editor);
+        // egui anchors an area with its previous size; the panel just grew
+        // from the collapsed bar, so let it settle for one frame.
+        harness.run_with_editor(&mut text, editor);
 
         assert!(
             harness.ctx.memory(|memory| memory.has_focus(editor)),
@@ -1508,6 +1662,7 @@ mod tests {
             .expect("send");
         sender
             .send(AgentEvent::ToolEnd {
+                id: "c1".to_owned(),
                 name: "board_sql".to_owned(),
                 ok: true,
             })

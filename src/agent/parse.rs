@@ -8,8 +8,34 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 
-use super::AgentEvent;
 use super::shared::Shared;
+use super::{AgentEvent, HistoryMessage};
+
+/// User and assistant text from Pi's `get_messages` AgentMessage list.
+fn history_messages(messages: &[Value]) -> Vec<HistoryMessage> {
+    messages
+        .iter()
+        .filter_map(|message| {
+            let user = match message.get("role").and_then(Value::as_str)? {
+                "user" => true,
+                "assistant" => false,
+                _ => return None,
+            };
+            let text = match message.get("content")? {
+                Value::String(text) => text.clone(),
+                Value::Array(parts) => parts
+                    .iter()
+                    .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+                    .filter_map(|part| part.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+                _ => return None,
+            };
+            let text = text.trim().to_owned();
+            (!text.is_empty()).then_some(HistoryMessage { user, text })
+        })
+        .collect()
+}
 
 /// Per-process parser state. Created fresh on every spawn so a restart cannot
 /// confuse old tool ids or text blocks with a new run.
@@ -69,10 +95,15 @@ impl ParserState {
             "message_end" => self.parse_message_end(record, &mut events),
             "tool_execution_start" => {
                 if let Some(name) = tool_name(record) {
-                    if let Some(id) = record.get("toolCallId").and_then(Value::as_str) {
-                        self.tools.insert(id.to_owned(), name.clone());
+                    let id = record
+                        .get("toolCallId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    if !id.is_empty() {
+                        self.tools.insert(id.clone(), name.clone());
                     }
-                    events.push(AgentEvent::ToolStart { name });
+                    events.push(AgentEvent::ToolStart { id, name });
                 }
             }
             "tool_execution_end" => {
@@ -86,7 +117,11 @@ impl ParserState {
                         .get("isError")
                         .and_then(Value::as_bool)
                         .unwrap_or(false);
-                    events.push(AgentEvent::ToolEnd { name, ok });
+                    events.push(AgentEvent::ToolEnd {
+                        id: id.unwrap_or_default().to_owned(),
+                        name,
+                        ok,
+                    });
                 }
             }
             "agent_end" => {
@@ -157,20 +192,31 @@ impl ParserState {
     }
 
     fn parse_response(&mut self, record: &Value, shared: &Shared, events: &mut Vec<AgentEvent>) {
-        if let Some(id) = record.get("id").and_then(Value::as_str) {
-            let _ = shared.take_pending(id);
-        }
+        let pending = record
+            .get("id")
+            .and_then(Value::as_str)
+            .and_then(|id| shared.take_pending(id));
         let success = record
             .get("success")
             .and_then(Value::as_bool)
             .unwrap_or(true);
-        if success {
-            return;
-        }
         let command = record
             .get("command")
             .and_then(Value::as_str)
-            .unwrap_or("command");
+            .map(str::to_owned)
+            .or(pending)
+            .unwrap_or_else(|| "command".to_owned());
+        if success {
+            if command == "get_messages"
+                && let Some(messages) = record
+                    .get("data")
+                    .and_then(|data| data.get("messages"))
+                    .and_then(Value::as_array)
+            {
+                events.push(AgentEvent::History(history_messages(messages)));
+            }
+            return;
+        }
         let message = record
             .get("error")
             .map(value_text)
@@ -180,6 +226,13 @@ impl ParserState {
             "pi {command} failed: {}",
             truncate(&message, 400)
         )));
+        if command == "prompt" {
+            // A rejected prompt (for example missing auth) never starts a
+            // run, so Pi sends no agent_settled: end the turn here.
+            events.push(AgentEvent::TurnEnd {
+                reason: "error".to_owned(),
+            });
+        }
     }
 
     fn parse_message_update(&mut self, record: &Value, events: &mut Vec<AgentEvent>) {
@@ -202,6 +255,7 @@ impl ParserState {
             "text_start" => {
                 self.text_started.insert(index);
                 self.text_streamed.remove(&index);
+                events.push(AgentEvent::TextBreak);
             }
             "text_delta" => {
                 if let Some(delta) = update.get("delta") {
@@ -371,6 +425,35 @@ mod tests {
         Shared::new(sender)
     }
 
+    #[test]
+    fn get_messages_becomes_history_with_text_only() {
+        let shared = shared();
+        shared.register_pending("g1", "get_messages");
+        let mut parser = ParserState::default();
+        let events = parser.parse_line(
+            br#"{"id":"g1","type":"response","success":true,"data":{"messages":[
+                {"role":"user","content":"add milk"},
+                {"role":"assistant","content":[{"type":"toolCall","name":"x"},{"type":"text","text":"Added."}]},
+                {"role":"toolResult","content":[{"type":"text","text":"ok"}]},
+                {"role":"assistant","content":[{"type":"thinking","thinking":"hm"}]}
+            ]}}"#,
+            &shared,
+        );
+        assert_eq!(
+            events,
+            vec![AgentEvent::History(vec![
+                HistoryMessage {
+                    user: true,
+                    text: "add milk".to_owned()
+                },
+                HistoryMessage {
+                    user: false,
+                    text: "Added.".to_owned()
+                },
+            ])]
+        );
+    }
+
     fn parse_all(jsonl: &str) -> Vec<AgentEvent> {
         let shared = shared();
         let mut parser = ParserState::default();
@@ -399,6 +482,7 @@ mod tests {
         assert_eq!(
             parse_all(NORMAL_TURN),
             vec![
+                AgentEvent::TextBreak,
                 AgentEvent::TextDelta("Hello".to_owned()),
                 AgentEvent::TextDelta(" world".to_owned()),
                 AgentEvent::TurnEnd {
@@ -418,7 +502,9 @@ mod tests {
         assert_eq!(
             parse_all(jsonl),
             vec![
+                AgentEvent::TextBreak,
                 AgentEvent::TextDelta("whole answer".to_owned()),
+                AgentEvent::TextBreak,
                 AgentEvent::TextDelta("streamed".to_owned()),
             ]
         );
@@ -440,23 +526,29 @@ mod tests {
             parse_all(TOOL_TURN),
             vec![
                 AgentEvent::ToolStart {
+                    id: "c1".to_owned(),
                     name: "mcp__rustboard__add_note".to_owned()
                 },
                 AgentEvent::ToolEnd {
+                    id: "c1".to_owned(),
                     name: "mcp__rustboard__add_note".to_owned(),
                     ok: true
                 },
                 AgentEvent::ToolStart {
+                    id: "c2".to_owned(),
                     name: "mcp__rustboard__board_sql".to_owned()
                 },
                 AgentEvent::ToolEnd {
+                    id: "c2".to_owned(),
                     name: "mcp__rustboard__board_sql".to_owned(),
                     ok: false
                 },
                 AgentEvent::ToolStart {
+                    id: "c3".to_owned(),
                     name: "mcp__rustboard__search".to_owned()
                 },
                 AgentEvent::ToolEnd {
+                    id: "c3".to_owned(),
                     name: "mcp__rustboard__search".to_owned(),
                     ok: true
                 },
@@ -480,6 +572,7 @@ mod tests {
         assert_eq!(
             parse_all(ABORTED_TURN),
             vec![
+                AgentEvent::TextBreak,
                 AgentEvent::TextDelta("Working".to_owned()),
                 AgentEvent::TurnEnd {
                     reason: "aborted".to_owned()
@@ -511,9 +604,13 @@ mod tests {
         );
         assert_eq!(
             response,
-            vec![AgentEvent::Error(
-                "pi prompt failed: No API key found for deepseek.".to_owned()
-            )]
+            vec![
+                AgentEvent::Error("pi prompt failed: No API key found for deepseek.".to_owned()),
+                AgentEvent::TurnEnd {
+                    reason: "error".to_owned()
+                },
+            ],
+            "a rejected prompt ends the turn so the UI cannot stay busy"
         );
         assert_eq!(shared.take_pending("p1"), None, "response id is correlated");
     }
