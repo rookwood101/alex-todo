@@ -680,3 +680,28 @@ fn an_unopenable_board_shows_an_error_screen_instead_of_panicking() {
     assert!(app.store.is_none());
     assert!(app.store_error.is_some());
 }
+
+#[test]
+fn the_chat_panel_shows_only_in_agent_mode() {
+    let mut headless = Headless::new("app-chat-visibility");
+    assert!(!headless.app.chat_visible(), "Capture mode hides the chat");
+    headless.app.composer.request_focus();
+    headless.run_frame(Vec::new());
+    headless.run_frame(Vec::new());
+    headless.key(Key::Tab);
+    assert_eq!(
+        headless.app.composer.mode(),
+        crate::ui::composer::ComposerMode::Agent
+    );
+    assert!(headless.app.chat_visible(), "Agent mode shows the chat");
+    headless.key(Key::Tab);
+    assert!(
+        !headless.app.chat_visible(),
+        "back in Capture mode it hides"
+    );
+    headless.app.chat.busy = true;
+    assert!(
+        headless.app.chat_visible(),
+        "a running turn keeps it visible"
+    );
+}

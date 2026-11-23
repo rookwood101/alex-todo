@@ -2677,7 +2677,10 @@ mod tests {
                 CONTAINER_TEXT_MAX,
                 1.0,
             );
-            assert!((BODY_TEXT_MIN..CONTAINER_TEXT_MAX).contains(&long), "{long}");
+            assert!(
+                (BODY_TEXT_MIN..CONTAINER_TEXT_MAX).contains(&long),
+                "{long}"
+            );
         });
     }
 
