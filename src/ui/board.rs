@@ -99,6 +99,10 @@ pub struct BoardView {
     marquee: Option<Marquee>,
     /// The arrow whose right-click menu is open.
     edge_menu: Option<EdgeId>,
+    /// The open due-date popover.
+    due_editor: Option<DueEditor>,
+    /// Targets chosen from a context menu; the popover opens next frame.
+    pending_due: Option<Vec<NoteId>>,
     editing: Option<NoteId>,
     edit_buffer: String,
     focus_requested: Option<NoteId>,
@@ -139,6 +143,16 @@ enum DropPlan {
     Pin { x: f32, y: f32 },
 }
 
+/// The due-date popover: a phrase field plus quick picks for `targets`.
+#[derive(Clone, Debug)]
+struct DueEditor {
+    targets: Vec<NoteId>,
+    text: String,
+    /// Screen position of the popover's top-left corner.
+    anchor: Pos2,
+    focus: bool,
+}
+
 /// A selection box drawn by a left-drag on empty canvas.
 #[derive(Clone, Debug)]
 struct Marquee {
@@ -169,6 +183,8 @@ impl BoardView {
             selected_edges: Vec::new(),
             marquee: None,
             edge_menu: None,
+            due_editor: None,
+            pending_due: None,
             editing: None,
             edit_buffer: String::new(),
             focus_requested: None,
@@ -332,6 +348,9 @@ impl BoardView {
 
         self.handle_wheel(ui, canvas_rect);
         self.handle_pan(ui, canvas_rect);
+        if let Some(targets) = self.pending_due.take() {
+            self.open_due_editor(&geometry, &targets, canvas_rect);
+        }
         self.handle_keys(ui, context, &geometry, &mut output);
         self.handle_note_input(ui, context, &geometry, canvas_rect, &mut output);
         self.handle_link_input(ui, context, &geometry, canvas_rect, &mut output);
@@ -375,6 +394,7 @@ impl BoardView {
         }
 
         self.edge_context_menu(context, &geometry, canvas_rect, &background, &mut output);
+        self.show_due_editor(ui, context, &mut output);
 
         if self.drag.is_some() || self.pan_button.is_some() {
             ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
@@ -901,13 +921,18 @@ impl BoardView {
         }
 
         let shift_ctrl = Modifiers::COMMAND | Modifiers::SHIFT;
-        let (ungroup, group, important) = ctx.input_mut(|input| {
+        let (ungroup, group, important, due) = ctx.input_mut(|input| {
             (
                 input.consume_key(shift_ctrl, Key::G),
                 input.consume_key(Modifiers::COMMAND, Key::G),
                 input.consume_key(Modifiers::COMMAND, Key::I),
+                input.consume_key(Modifiers::COMMAND, Key::D),
             )
         });
+        if due {
+            let targets = self.selected.clone();
+            self.open_due_editor(geometry, &targets, ui.max_rect());
+        }
         if group {
             self.group_selection(context.board, output);
         }
@@ -984,6 +1009,149 @@ impl BoardView {
             text: String::new(),
         });
         output.edit_new_note = true;
+    }
+
+    /// Open the due-date popover for `targets` under the first one.
+    fn open_due_editor(&mut self, geometry: &Geometry, targets: &[NoteId], canvas_rect: Rect) {
+        if targets.is_empty() {
+            return;
+        }
+        let anchor = geometry
+            .screen_rect(&targets[0], &self.camera, canvas_rect)
+            .map_or(canvas_rect.center() - vec2(140.0, 60.0), |rect| {
+                rect.left_bottom() + vec2(0.0, 6.0)
+            });
+        self.due_editor = Some(DueEditor {
+            targets: targets.to_vec(),
+            text: String::new(),
+            anchor,
+            focus: true,
+        });
+    }
+
+    fn show_due_editor(
+        &mut self,
+        ui: &mut Ui,
+        context: &BoardContext<'_>,
+        output: &mut BoardOutput,
+    ) {
+        let Some(mut editor) = self.due_editor.take() else {
+            return;
+        };
+        let ctx = ui.ctx().clone();
+        let field_id = egui::Id::unique("rustboard.due_editor.field");
+        let field_focused = ctx.memory(|memory| memory.has_focus(field_id));
+        let escape =
+            field_focused && ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape));
+        let enter =
+            field_focused && ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Enter));
+        if escape {
+            surrender_focus(&ctx);
+            return;
+        }
+        let parsed = crate::capture::parse_due_phrase(&editor.text, context.now_utc_ms, context.tz);
+        let mut chosen: Option<Option<TimeSpec>> = None;
+        if enter && parsed.is_some() {
+            chosen = Some(parsed.clone());
+        }
+        let any_due = editor.targets.iter().any(|id| {
+            context
+                .board
+                .note(id)
+                .is_some_and(|note| note.due.is_some())
+        });
+        let mut close = false;
+        let area = egui::Area::new(egui::Id::unique("rustboard.due_editor"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(editor.anchor)
+            .constrain(true)
+            .show(&ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_width(280.0);
+                    let count = editor.targets.len();
+                    ui.label(
+                        RichText::new(if count == 1 {
+                            "Due date".to_owned()
+                        } else {
+                            format!("Due date for {count} notes")
+                        })
+                        .strong(),
+                    );
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut editor.text)
+                            .id(field_id)
+                            .hint_text("fri 4pm, tomorrow, in 2h, 12/1 9:30")
+                            .desired_width(f32::INFINITY),
+                    );
+                    if editor.focus {
+                        response.request_focus();
+                        editor.focus = false;
+                    }
+                    let preview = match (&parsed, editor.text.trim().is_empty()) {
+                        (Some(spec), _) => due_label(spec, context.now_utc_ms).map_or_else(
+                            || spec.local.replace('T', " "),
+                            |(label, _)| {
+                                let exact = spec.local.replace('T', " ");
+                                format!("{label}  ({})", exact.get(..16).unwrap_or(&exact))
+                            },
+                        ),
+                        (None, true) => "Type a date or pick one below".to_owned(),
+                        (None, false) => "Not understood yet".to_owned(),
+                    };
+                    ui.label(RichText::new(preview).size(12.0).color(theme::TEXT_MUTED));
+                    ui.horizontal_wrapped(|ui| {
+                        for (label, phrase) in [
+                            ("Today", "eod"),
+                            ("Tomorrow", "tomorrow"),
+                            ("Next week", "next week"),
+                            ("Weekend", "weekend"),
+                        ] {
+                            if ui.button(label).clicked() {
+                                chosen = Some(crate::capture::parse_due_phrase(
+                                    phrase,
+                                    context.now_utc_ms,
+                                    context.tz,
+                                ));
+                            }
+                        }
+                        if any_due
+                            && ui
+                                .button(RichText::new("Clear").color(theme::SAVE_ERROR))
+                                .clicked()
+                        {
+                            chosen = Some(None);
+                        }
+                    });
+                    ui.label(
+                        RichText::new(
+                            "Enter sets · Esc closes · the reminder follows the due date",
+                        )
+                        .size(10.5)
+                        .color(theme::TEXT_MUTED),
+                    );
+                });
+            });
+        if let Some(due) = chosen {
+            output
+                .commands
+                .extend(editor.targets.iter().filter_map(|id| {
+                    context.board.note(id).map(|_| Command::SetDue {
+                        id: id.clone(),
+                        due: due.clone(),
+                    })
+                }));
+            close = true;
+        }
+        // A click outside the popover closes it.
+        let clicked_outside = ctx.input(|input| input.pointer.any_pressed())
+            && ctx
+                .input(|input| input.pointer.interact_pos())
+                .is_some_and(|pointer| !area.response.rect.contains(pointer));
+        if close || (clicked_outside && !editor.focus) {
+            surrender_focus(&ctx);
+            return;
+        }
+        self.due_editor = Some(editor);
     }
 
     fn editor_id(&self, ui: &Ui) -> Option<egui::Id> {
@@ -1203,7 +1371,14 @@ impl BoardView {
             }
 
             if !container {
-                paint_due_chip(painter, screen, note, self.camera.zoom, opacity);
+                paint_due_chip(
+                    painter,
+                    screen,
+                    note,
+                    self.camera.zoom,
+                    opacity,
+                    context.now_utc_ms,
+                );
                 if is_snoozed(note, context.now_utc_ms) {
                     paint_snooze_mark(painter, screen, self.camera.zoom, opacity);
                 }
@@ -1328,6 +1503,10 @@ impl BoardView {
                     .extend(toggle_important_commands(context.board, targets));
                 ui.close();
             }
+        }
+        if !protected && ui.button("Due date…").on_hover_text("Ctrl+D").clicked() {
+            self.pending_due = Some(targets.to_vec());
+            ui.close();
         }
         if ui.button("Snooze 1 hour").clicked() {
             if let Some(until) = snooze_after(context.now_utc_ms, 60, context.tz) {
@@ -2036,20 +2215,112 @@ fn paint_card(
     painter.rect_stroke(card, corner, stroke, StrokeKind::Inside);
 }
 
-fn paint_due_chip(painter: &egui::Painter, card: Rect, note: &Note, zoom: f32, opacity: f32) {
+fn paint_due_chip(
+    painter: &egui::Painter,
+    card: Rect,
+    note: &Note,
+    zoom: f32,
+    opacity: f32,
+    now_utc_ms: i64,
+) {
     let Some(due) = &note.due else {
         return;
     };
-    let label = format_due(due);
+    let Some((label, state)) = due_label(due, now_utc_ms) else {
+        return;
+    };
+    let state = if note.status == Status::Done {
+        DueState::Later
+    } else {
+        state
+    };
+    let (fill, ink) = match state {
+        DueState::Overdue => (theme::IMPORTANT, Color32::WHITE),
+        DueState::Today => (theme::SAVE_WARN, theme::CANVAS_BG),
+        DueState::Later => (theme::NOTE_SHADOW, theme::NOTE_INK),
+    };
     let font_size = (11.0 * zoom).clamp(4.0, 14.0);
     let padding = (theme::NOTE_PADDING * zoom).max(2.0);
-    painter.text(
-        pos2(card.left() + padding, card.bottom() - padding),
-        Align2::LEFT_BOTTOM,
-        label,
-        FontId::proportional(font_size),
-        dim(theme::NOTE_INK, opacity * 0.8),
+    let galley = painter.layout_no_wrap(label, FontId::proportional(font_size), dim(ink, opacity));
+    let pill = Rect::from_min_size(
+        pos2(
+            card.left() + padding,
+            card.bottom() - padding - galley.size().y - 2.0 * zoom,
+        ),
+        galley.size() + vec2(8.0 * zoom, 2.0 * zoom),
     );
+    painter.rect_filled(pill, (4.0 * zoom) as u8, dim(fill, opacity * 0.9));
+    painter.galley(
+        pill.min + vec2(4.0 * zoom, zoom),
+        galley,
+        Color32::TRANSPARENT,
+    );
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DueState {
+    Overdue,
+    Today,
+    Later,
+}
+
+/// "today 16:00", "tomorrow 09:00", "Fri 16:00", "27 Nov", "27 Nov 2027",
+/// shown in the due date's own wall time, with its urgency.
+fn due_label(due: &TimeSpec, now_utc_ms: i64) -> Option<(String, DueState)> {
+    let resolved = due.resolve().ok()?;
+    let local: jiff::civil::DateTime = due.local.parse().ok()?;
+    let zone = jiff::tz::TimeZone::get(&due.tz).ok()?;
+    let today = zone
+        .to_datetime(jiff::Timestamp::from_millisecond(now_utc_ms).ok()?)
+        .date();
+    let days = i64::from(today.until(local.date()).ok()?.get_days());
+    let time = format!("{:02}:{:02}", local.hour(), local.minute());
+    let label = match days {
+        0 => format!("today {time}"),
+        1 => format!("tomorrow {time}"),
+        -1 => format!("yesterday {time}"),
+        2..=6 => format!("{} {time}", weekday_short(local.date().weekday())),
+        _ if local.year() == today.year() => {
+            format!("{} {}", local.day(), month_short(local.month()))
+        }
+        _ => format!(
+            "{} {} {}",
+            local.day(),
+            month_short(local.month()),
+            local.year()
+        ),
+    };
+    let state = if resolved.utc_ms <= now_utc_ms {
+        DueState::Overdue
+    } else if days == 0 {
+        DueState::Today
+    } else {
+        DueState::Later
+    };
+    Some((label, state))
+}
+
+fn weekday_short(weekday: jiff::civil::Weekday) -> &'static str {
+    use jiff::civil::Weekday;
+    match weekday {
+        Weekday::Monday => "Mon",
+        Weekday::Tuesday => "Tue",
+        Weekday::Wednesday => "Wed",
+        Weekday::Thursday => "Thu",
+        Weekday::Friday => "Fri",
+        Weekday::Saturday => "Sat",
+        Weekday::Sunday => "Sun",
+    }
+}
+
+fn month_short(month: i8) -> &'static str {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    MONTHS
+        .get(usize::try_from(month - 1).unwrap_or(0))
+        .copied()
+        .unwrap_or("?")
 }
 
 fn paint_snooze_mark(painter: &egui::Painter, card: Rect, zoom: f32, opacity: f32) {
@@ -2228,14 +2499,6 @@ fn border_point(rect: Rect, from: Pos2) -> Pos2 {
 
 fn first_line(text: &str) -> &str {
     text.lines().next().unwrap_or("").trim()
-}
-
-fn format_due(due: &TimeSpec) -> String {
-    let local = due.local.as_str();
-    match (local.get(5..7), local.get(8..10), local.get(11..16)) {
-        (Some(month), Some(day), Some(time)) => format!("due {month}-{day} {time}"),
-        _ => format!("due {local}"),
-    }
 }
 
 /// Opacity for a note: only an active snooze dims it.
@@ -2735,6 +2998,32 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn due_labels_are_relative_and_coloured_by_urgency() {
+        let at = |local: &str| TimeSpec {
+            local: local.to_owned(),
+            tz: TZ.to_owned(),
+        };
+        // Sunday 2026-11-22 08:00 London.
+        let now = at("2026-11-22T08:00:00").resolve().expect("now").utc_ms;
+        let cases = [
+            ("2026-11-22T16:00:00", "today 16:00", DueState::Today),
+            ("2026-11-22T07:00:00", "today 07:00", DueState::Overdue),
+            ("2026-11-23T09:00:00", "tomorrow 09:00", DueState::Later),
+            ("2026-11-21T09:00:00", "yesterday 09:00", DueState::Overdue),
+            ("2026-11-27T16:00:00", "Fri 16:00", DueState::Later),
+            ("2026-12-25T09:00:00", "25 Dec", DueState::Later),
+            ("2027-01-02T09:00:00", "2 Jan 2027", DueState::Later),
+        ];
+        for (local, label, state) in cases {
+            assert_eq!(
+                due_label(&at(local), now),
+                Some((label.to_owned(), state)),
+                "{local}"
+            );
+        }
     }
 
     #[test]

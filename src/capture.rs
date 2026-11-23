@@ -169,6 +169,16 @@ pub fn parse_capture(
     }
 }
 
+/// Parse a whole phrase as a deadline ("fri 4pm", "in 2h", "@tomorrow").
+/// Returns None unless the entire phrase is a date/time.
+pub fn parse_due_phrase(input: &str, now_utc_ms: i64, tz: &str) -> Option<TimeSpec> {
+    let parsed = parse_capture(input, now_utc_ms, tz, &[]);
+    if !parsed.text.trim().is_empty() || parsed.group.is_some() || parsed.important {
+        return None;
+    }
+    parsed.due
+}
+
 /// A whitespace-delimited token with its byte range in the input.
 struct Token<'a> {
     text: &'a str,

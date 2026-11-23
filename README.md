@@ -76,6 +76,7 @@ all three binaries:
 | Drag a note (or the selection) | Drop on a note's left/right edge to reorder next to it, on its middle to nest inside it, on empty canvas to pin it there |
 | Ctrl+G / Ctrl+Shift+G | Group the selection into a new container / ungroup a container |
 | Click the "!" slot / Ctrl+I | Toggle important (shown as a red "!") |
+| Ctrl+D / right-click → Due date… | Set or clear the due date of the selection (type a phrase or pick Today/Tomorrow/Next week/Weekend); the reminder follows the due date unless set separately |
 | Drag the dot on a note's right edge (shown on hover) | Draw an arrow to another note |
 | Right-click an arrow | Delete the link (or select it and press Delete) |
 | Right-click a note | Edit, done/reopen, important, snooze, unpin, group/ungroup, delete (acts on the whole selection) |

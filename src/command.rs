@@ -806,6 +806,18 @@ fn apply_one(
                   WHERE id = ?4 AND deleted_at_utc_ms IS NULL",
                 params![local, tz, utc_ms, id],
             )?;
+            // The reminder follows the due date unless it was set separately
+            // (it is unset, or it still equals the old due date).
+            let follows = before.remind.is_none() || before.remind == before.due;
+            if follows && before.remind.as_ref() != due.as_ref() {
+                tx.execute(
+                    "UPDATE notes
+                        SET remind_local = ?1, remind_tz = ?2, remind_utc_ms = ?3,
+                            reminded_at_utc_ms = NULL
+                      WHERE id = ?4 AND deleted_at_utc_ms IS NULL",
+                    params![local, tz, utc_ms, id],
+                )?;
+            }
             let after = reload_note(tx, id)?;
             emit_note(ctx, tx, command, &before, &after)?;
             Ok(effect_for(command, "note", id, 1))
@@ -946,8 +958,9 @@ fn add_note(
         .map(TimeSpec::to_sql_parts)
         .transpose()
         .map_err(time_error)?;
+    // A due date brings a reminder at the same time unless one is given.
+    let remind = remind.as_ref().or(due.as_ref());
     let remind_parts = remind
-        .as_ref()
         .map(TimeSpec::to_sql_parts)
         .transpose()
         .map_err(time_error)?;
@@ -1842,6 +1855,70 @@ mod tests {
             ) || error.to_string().contains("ancestor"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn a_due_date_brings_a_reminder_that_follows_it_unless_set_separately() {
+        let mut store = store("cmd-due-remind");
+        let id = add(&mut store, "task");
+        let at = |local: &str| TimeSpec {
+            local: local.to_owned(),
+            tz: "Europe/London".to_owned(),
+        };
+        let apply = |store: &mut Store, command: Command| {
+            store.apply(&[command], Actor::Human, None).expect("apply");
+        };
+        apply(
+            &mut store,
+            Command::SetDue {
+                id: id.clone(),
+                due: Some(at("2030-01-01T09:00:00")),
+            },
+        );
+        assert_eq!(note(&store, &id).remind, Some(at("2030-01-01T09:00:00")));
+        apply(
+            &mut store,
+            Command::SetDue {
+                id: id.clone(),
+                due: Some(at("2030-01-02T09:00:00")),
+            },
+        );
+        assert_eq!(note(&store, &id).remind, Some(at("2030-01-02T09:00:00")));
+        apply(
+            &mut store,
+            Command::SetRemind {
+                id: id.clone(),
+                remind: Some(at("2030-01-01T18:00:00")),
+            },
+        );
+        apply(
+            &mut store,
+            Command::SetDue {
+                id: id.clone(),
+                due: Some(at("2030-01-05T09:00:00")),
+            },
+        );
+        assert_eq!(
+            note(&store, &id).remind,
+            Some(at("2030-01-01T18:00:00")),
+            "a separate reminder is kept"
+        );
+        apply(
+            &mut store,
+            Command::SetRemind {
+                id: id.clone(),
+                remind: Some(at("2030-01-05T09:00:00")),
+            },
+        );
+        apply(
+            &mut store,
+            Command::SetDue {
+                id: id.clone(),
+                due: None,
+            },
+        );
+        let cleared = note(&store, &id);
+        assert!(cleared.due.is_none() && cleared.remind.is_none());
     }
 
     #[test]
