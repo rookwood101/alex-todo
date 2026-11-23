@@ -19,7 +19,11 @@
 //!   itself or one of its descendants is rejected;
 //! * a single selected note shows a link handle; drag it onto another note to
 //!   link;
-//! * done notes are not painted; snoozed notes are painted at 35% opacity.
+//! * each note has a checkbox; Ctrl+Enter toggles done on the selection; done
+//!   notes stay in place with struck-through, muted text and sort after their
+//!   open siblings; "Hide done" omits done notes that have no open descendants;
+//! * containers show "done/total" for their direct children;
+//! * snoozed notes are painted at 35% opacity.
 
 use std::collections::HashMap;
 
@@ -45,6 +49,8 @@ const EDGE_HIT_RADIUS: f32 = 7.0;
 const LINK_HANDLE_RADIUS: f32 = 7.0;
 /// Height of a container header in world units (matches the layout engine).
 const CONTAINER_HEADER: f32 = 36.0;
+/// Side of the done checkbox in world units.
+const CHECKBOX_SIZE: f32 = 16.0;
 
 /// Everything the view needs from the app for one frame.
 pub struct BoardContext<'a> {
@@ -52,6 +58,8 @@ pub struct BoardContext<'a> {
     pub now_utc_ms: i64,
     /// IANA zone used to format deadlines and to build snooze values.
     pub tz: &'a str,
+    /// Omit done notes that have no open descendants.
+    pub hide_done: bool,
 }
 
 /// What the frame produced. The app applies the commands in one batch.
@@ -216,11 +224,7 @@ impl BoardView {
 
     /// Clear transient state after a board reload.
     pub fn after_reload(&mut self, board: &Board) {
-        self.selected.retain(|id| {
-            board
-                .note(id)
-                .is_some_and(|note| note.status != Status::Done)
-        });
+        self.selected.retain(|id| board.note(id).is_some());
         self.selected_edges.retain(|id| board.edge(id).is_some());
         if let Some(id) = &self.editing
             && board.note(id).is_none()
@@ -243,7 +247,19 @@ impl BoardView {
     /// Screen rect of a note for the given canvas (test seam for the app tests).
     #[cfg(test)]
     pub(crate) fn screen_rect_for(&self, board: &Board, id: &str, canvas: Rect) -> Option<Rect> {
-        Geometry::build(board, 0).screen_rect(id, &self.camera, canvas)
+        Geometry::build(board, 0, false).screen_rect(id, &self.camera, canvas)
+    }
+
+    /// Centre of a note's done checkbox (test seam for the app tests).
+    #[cfg(test)]
+    pub(crate) fn checkbox_center_for(
+        &self,
+        board: &Board,
+        id: &str,
+        canvas: Rect,
+    ) -> Option<Pos2> {
+        let screen = self.screen_rect_for(board, id, canvas)?;
+        Some(checkbox_rect(header_rect(screen, self.camera.zoom), self.camera.zoom).center())
     }
 
     /// Draw the board and return the commands the input produced.
@@ -264,7 +280,7 @@ impl BoardView {
         }
         output.canvas_rect = canvas_rect;
 
-        let geometry = Geometry::build(context.board, context.now_utc_ms);
+        let geometry = Geometry::build(context.board, context.now_utc_ms, context.hide_done);
 
         if self.fit_requested {
             self.fit_requested = false;
@@ -277,7 +293,7 @@ impl BoardView {
 
         self.handle_wheel(ui, canvas_rect);
         self.handle_pan(ui, canvas_rect);
-        self.handle_keys(ui, context, &mut output);
+        self.handle_keys(ui, context, &geometry, &mut output);
         self.handle_note_input(ui, context, &geometry, canvas_rect, &mut output);
         self.handle_link_input(ui, context, &geometry, canvas_rect, &mut output);
 
@@ -526,6 +542,14 @@ impl BoardView {
         self.finish_edit(context.board, true, output);
         surrender_focus(ui.ctx());
 
+        if let Some(id) = self.checkbox_at(geometry, context, pointer, canvas_rect) {
+            output.commands.extend(toggle_done_commands(
+                context.board,
+                std::slice::from_ref(&id),
+            ));
+            return;
+        }
+
         if let Some(id) = self.link_handle_at(geometry, context, pointer, canvas_rect) {
             self.link = Some(LinkDrag { from: id });
             return;
@@ -588,7 +612,6 @@ impl BoardView {
             .board
             .notes
             .iter()
-            .filter(|note| note.status != Status::Done)
             .filter(|note| {
                 geometry
                     .screen_rect(&note.id, &self.camera, canvas_rect)
@@ -596,6 +619,23 @@ impl BoardView {
             })
             .map(|note| note.id.clone())
             .collect()
+    }
+
+    /// The note whose done checkbox is under the pointer.
+    fn checkbox_at(
+        &self,
+        geometry: &Geometry,
+        context: &BoardContext<'_>,
+        pointer: Pos2,
+        canvas_rect: Rect,
+    ) -> Option<NoteId> {
+        let id = self.hit_note(geometry, context, pointer, canvas_rect)?;
+        let screen = geometry.screen_rect(&id, &self.camera, canvas_rect)?;
+        let header = header_rect(screen, self.camera.zoom);
+        checkbox_rect(header, self.camera.zoom)
+            .expand(2.0)
+            .contains(pointer)
+            .then_some(id)
     }
 
     /// The note whose link handle is under the pointer (single selection only).
@@ -665,7 +705,13 @@ impl BoardView {
 
     /// Board keys. They act only when no text field has keyboard focus, except
     /// Escape, which also closes the inline editor.
-    fn handle_keys(&mut self, ui: &mut Ui, context: &BoardContext<'_>, output: &mut BoardOutput) {
+    fn handle_keys(
+        &mut self,
+        ui: &mut Ui,
+        context: &BoardContext<'_>,
+        geometry: &Geometry,
+        output: &mut BoardOutput,
+    ) {
         let ctx = ui.ctx().clone();
         let focused = ctx.memory(|memory| memory.focused());
         let editor_focused = self.editing.is_some()
@@ -683,14 +729,15 @@ impl BoardView {
             return;
         }
 
-        let (escape, delete, enter, select_all) = ctx.input_mut(|input| {
+        let (escape, delete, enter, select_all, toggle_done) = ctx.input_mut(|input| {
             let escape = !self.selected.is_empty() || !self.selected_edges.is_empty();
             let escape = escape && input.consume_key(Modifiers::NONE, Key::Escape);
             let delete = input.consume_key(Modifiers::NONE, Key::Delete)
                 | input.consume_key(Modifiers::NONE, Key::Backspace);
+            let toggle_done = input.consume_key(Modifiers::COMMAND, Key::Enter);
             let enter = input.consume_key(Modifiers::NONE, Key::Enter);
             let select_all = input.consume_key(Modifiers::COMMAND, Key::A);
-            (escape, delete, enter, select_all)
+            (escape, delete, enter, select_all, toggle_done)
         });
 
         if escape {
@@ -705,12 +752,17 @@ impl BoardView {
         if enter && let Some(id) = self.single_selected().cloned() {
             self.edit_note(context.board, id);
         }
+        if toggle_done {
+            output
+                .commands
+                .extend(toggle_done_commands(context.board, &self.selected));
+        }
         if select_all {
             self.selected = context
                 .board
                 .notes
                 .iter()
-                .filter(|note| note.status != Status::Done)
+                .filter(|note| geometry.world_rect(&note.id).is_some())
                 .map(|note| note.id.clone())
                 .collect();
             self.selected_edges.clear();
@@ -763,9 +815,6 @@ impl BoardView {
     ) -> Option<NoteId> {
         let mut best: Option<(f32, NoteId)> = None;
         for note in &context.board.notes {
-            if note.status == Status::Done {
-                continue;
-            }
             if let Some(rect) = geometry.screen_rect(&note.id, &self.camera, canvas_rect)
                 && rect.contains(pointer)
             {
@@ -820,9 +869,6 @@ impl BoardView {
         order.sort_by_key(|note| !geometry.is_container(&note.id));
 
         for note in order {
-            if note.status == Status::Done {
-                continue;
-            }
             let Some(screen) = geometry.screen_rect(&note.id, &self.camera, canvas_rect) else {
                 continue;
             };
@@ -833,9 +879,8 @@ impl BoardView {
             let palette = theme::note_palette(note.color.clamp(0, 255) as u8);
             let selected = self.is_selected(&note.id);
             let container = geometry.is_container(&note.id);
-            let header_height = (CONTAINER_HEADER * self.camera.zoom)
-                .clamp(10.0, (screen.height() * 0.5).max(10.0));
-            let header = Rect::from_min_size(screen.min, vec2(screen.width(), header_height));
+            let header = header_rect(screen, self.camera.zoom);
+            let done = note.status == Status::Done;
 
             paint_card(
                 painter,
@@ -849,19 +894,59 @@ impl BoardView {
 
             let title = first_line(&note.text);
             let title_font = (theme::NOTE_TEXT_SIZE * self.camera.zoom * 0.9).max(4.0);
-            let text_color = dim(palette.ink, opacity);
+            let text_color = if done {
+                dim(palette.ink, opacity * 0.45)
+            } else {
+                dim(palette.ink, opacity)
+            };
             let padding = (theme::NOTE_PADDING * self.camera.zoom).max(2.0);
-            painter.text(
-                pos2(screen.left() + padding, header.center().y),
-                Align2::LEFT_CENTER,
-                if title.is_empty() {
-                    if container { "Group" } else { "Untitled" }
-                } else {
-                    title
-                },
+            let checkbox = checkbox_rect(header, self.camera.zoom);
+            paint_checkbox(painter, checkbox, done, palette.ink, opacity);
+            let title_left = checkbox.right() + padding * 0.75;
+            let progress = container
+                .then(|| child_progress(context.board, &note.id))
+                .flatten();
+            let progress_width = if let Some((closed, total)) = progress {
+                let galley = painter.layout_no_wrap(
+                    format!("{closed}/{total}"),
+                    FontId::proportional(title_font * 0.85),
+                    dim(palette.ink, opacity * 0.6),
+                );
+                let width = galley.size().x;
+                painter.galley(
+                    pos2(
+                        header.right() - padding - width,
+                        header.center().y - galley.size().y * 0.5,
+                    ),
+                    galley,
+                    Color32::TRANSPARENT,
+                );
+                width + padding
+            } else {
+                0.0
+            };
+            let label = if title.is_empty() { "Untitled" } else { title };
+            let max_width = (header.right() - padding - progress_width - title_left).max(0.0);
+            let galley = painter.layout(
+                label.to_owned(),
                 FontId::proportional(title_font),
                 text_color,
+                f32::INFINITY,
             );
+            let title_rect = Rect::from_min_size(
+                pos2(title_left, header.center().y - galley.size().y * 0.5),
+                vec2(galley.size().x.min(max_width), galley.size().y),
+            );
+            painter
+                .with_clip_rect(title_rect.intersect(canvas_rect))
+                .galley(title_rect.min, galley, text_color);
+            if done && title_rect.width() > 0.0 {
+                painter.hline(
+                    title_rect.x_range(),
+                    title_rect.center().y,
+                    Stroke::new((1.2 * self.camera.zoom).clamp(0.6, 2.0), text_color),
+                );
+            }
 
             if !container {
                 paint_due_chip(painter, screen, note, self.camera.zoom, opacity);
@@ -953,15 +1038,21 @@ impl BoardView {
             self.edit_note(context.board, note.id.clone());
             ui.close();
         }
-        if ui
-            .button(if many { "Mark all done" } else { "Mark done" })
-            .clicked()
-        {
-            output.commands.extend(
-                targets
-                    .iter()
-                    .map(|id| Command::Complete { id: id.clone() }),
-            );
+        let all_done = targets.iter().all(|id| {
+            context
+                .board
+                .note(id)
+                .is_some_and(|note| note.status == Status::Done)
+        });
+        let label = match (all_done, many) {
+            (true, _) => "Reopen",
+            (false, true) => "Mark all done",
+            (false, false) => "Mark done",
+        };
+        if ui.button(label).on_hover_text("Ctrl+Enter").clicked() {
+            output
+                .commands
+                .extend(toggle_done_commands(context.board, targets));
             ui.close();
         }
         if ui.button("Snooze 1 hour").clicked() {
@@ -1090,7 +1181,12 @@ struct Geometry {
 }
 
 impl Geometry {
-    fn build(board: &Board, now_utc_ms: i64) -> Self {
+    fn build(board: &Board, now_utc_ms: i64, hide_done: bool) -> Self {
+        let hidden = if hide_done {
+            hidden_done_notes(board)
+        } else {
+            std::collections::HashSet::new()
+        };
         let group_nums: HashMap<GroupId, u64> = board
             .groups
             .iter()
@@ -1122,6 +1218,7 @@ impl Geometry {
                     .as_ref()
                     .and_then(|group| group_nums.get(group).copied()),
                 done: note.status == Status::Done,
+                hidden: hidden.contains(&note.id),
                 snoozed: is_snoozed(note, now_utc_ms),
                 pinned: note.layout == crate::model::LayoutMode::Pinned,
                 x: note.pos.map(|pos| pos.x).unwrap_or(0.0),
@@ -1199,6 +1296,31 @@ impl Geometry {
         });
         candidates.first().map(|(id, _)| (*id).clone())
     }
+}
+
+/// Done notes with no open descendants: the set "Hide done" removes.
+fn hidden_done_notes(board: &Board) -> std::collections::HashSet<NoteId> {
+    let mut children: HashMap<&str, Vec<&Note>> = HashMap::new();
+    for note in &board.notes {
+        if let Some(parent) = &note.parent {
+            children.entry(parent.as_str()).or_default().push(note);
+        }
+    }
+    fn has_open(note: &Note, children: &HashMap<&str, Vec<&Note>>, depth: usize) -> bool {
+        if depth > 64 {
+            return true;
+        }
+        note.status != Status::Done
+            || children
+                .get(note.id.as_str())
+                .is_some_and(|kids| kids.iter().any(|kid| has_open(kid, children, depth + 1)))
+    }
+    board
+        .notes
+        .iter()
+        .filter(|note| !has_open(note, &children, 0))
+        .map(|note| note.id.clone())
+        .collect()
 }
 
 /// True when candidate is the note itself or one of its descendants, which
@@ -1488,6 +1610,82 @@ fn paint_snooze_mark(painter: &egui::Painter, card: Rect, zoom: f32, opacity: f3
     );
 }
 
+/// The title strip at the top of every card.
+fn header_rect(screen: Rect, zoom: f32) -> Rect {
+    let height = (CONTAINER_HEADER * zoom).clamp(10.0, (screen.height() * 0.5).max(10.0));
+    Rect::from_min_size(screen.min, vec2(screen.width(), height))
+}
+
+/// The done checkbox at the left of a header.
+fn checkbox_rect(header: Rect, zoom: f32) -> Rect {
+    let side = (CHECKBOX_SIZE * zoom).clamp(6.0, header.height() * 0.8);
+    let padding = (theme::NOTE_PADDING * zoom).max(2.0);
+    Rect::from_min_size(
+        pos2(header.left() + padding, header.center().y - side * 0.5),
+        vec2(side, side),
+    )
+}
+
+fn paint_checkbox(painter: &egui::Painter, rect: Rect, done: bool, ink: Color32, opacity: f32) {
+    let corner = (rect.width() * 0.2) as u8;
+    if done {
+        painter.rect_filled(rect, corner, dim(theme::ACCENT, opacity));
+        let width = rect.width();
+        let points = vec![
+            rect.left_top() + vec2(width * 0.22, width * 0.52),
+            rect.left_top() + vec2(width * 0.42, width * 0.72),
+            rect.left_top() + vec2(width * 0.78, width * 0.30),
+        ];
+        painter.add(egui::Shape::line(
+            points,
+            Stroke::new((width * 0.14).max(1.0), dim(theme::CANVAS_BG, opacity)),
+        ));
+    } else {
+        painter.rect_stroke(
+            rect,
+            corner,
+            Stroke::new((rect.width() * 0.09).max(1.0), dim(ink, opacity * 0.7)),
+            StrokeKind::Inside,
+        );
+    }
+}
+
+/// (done, total) over a container's direct children.
+fn child_progress(board: &Board, id: &str) -> Option<(usize, usize)> {
+    let children = board
+        .notes
+        .iter()
+        .filter(|note| note.parent.as_deref() == Some(id));
+    let (done, total) = children.fold((0, 0), |(done, total), note| {
+        (done + usize::from(note.status == Status::Done), total + 1)
+    });
+    (total > 0).then_some((done, total))
+}
+
+/// Complete every open target, or reopen them all when every target is done.
+fn toggle_done_commands(board: &Board, targets: &[NoteId]) -> Vec<Command> {
+    let notes: Vec<&Note> = targets.iter().filter_map(|id| board.note(id)).collect();
+    if notes.is_empty() {
+        return Vec::new();
+    }
+    if notes.iter().all(|note| note.status == Status::Done) {
+        notes
+            .iter()
+            .map(|note| Command::Reopen {
+                id: note.id.clone(),
+            })
+            .collect()
+    } else {
+        notes
+            .iter()
+            .filter(|note| note.status != Status::Done)
+            .map(|note| Command::Complete {
+                id: note.id.clone(),
+            })
+            .collect()
+    }
+}
+
 /// Centre of the link handle drawn on a selected note's right edge.
 fn link_handle_center(screen: Rect) -> Pos2 {
     pos2(screen.right() - 16.0, screen.center().y)
@@ -1613,12 +1811,12 @@ mod tests {
     }
 
     #[test]
-    fn geometry_omits_done_notes_and_marks_containers() {
+    fn geometry_hides_done_leaves_and_marks_containers() {
         let mut store = store("board-geometry");
         let (_, root) = board_and_root(&mut store);
         let child = add_note(&mut store, "child", Some(&root));
         let board = Board::load(store.connection()).expect("load");
-        let geometry = Geometry::build(&board, 1_800_000_000_000);
+        let geometry = Geometry::build(&board, 1_800_000_000_000, true);
         assert!(
             geometry.is_container(&root),
             "a note with children is a container"
@@ -1633,10 +1831,10 @@ mod tests {
             )
             .expect("complete");
         let board = Board::load(store.connection()).expect("load");
-        let geometry = Geometry::build(&board, 1_800_000_000_000);
+        let geometry = Geometry::build(&board, 1_800_000_000_000, true);
         assert!(
             geometry.world_rect(&child).is_none(),
-            "a done note has no rect"
+            "a done leaf has no rect when done notes are hidden"
         );
     }
 
@@ -1644,7 +1842,7 @@ mod tests {
     fn root_drop_pins_at_the_pointer() {
         let mut store = store("board-pin");
         let (board, root) = board_and_root(&mut store);
-        let geometry = Geometry::build(&board, 0);
+        let geometry = Geometry::build(&board, 0, false);
         let mut view = BoardView::new();
         view.drag = Some(NoteDrag {
             id: root.clone(),
@@ -1666,7 +1864,7 @@ mod tests {
         let (_, root) = board_and_root(&mut store);
         let child = add_note(&mut store, "child", Some(&root));
         let board = Board::load(store.connection()).expect("load");
-        let geometry = Geometry::build(&board, 0);
+        let geometry = Geometry::build(&board, 0, false);
         let rects = geometry.world_rects();
         let mut view = BoardView::new();
         view.drag = Some(NoteDrag {
@@ -1688,7 +1886,7 @@ mod tests {
         let (_, root) = board_and_root(&mut store);
         let child = add_note(&mut store, "child", Some(&root));
         let board = Board::load(store.connection()).expect("load");
-        let geometry = Geometry::build(&board, 0);
+        let geometry = Geometry::build(&board, 0, false);
         let rects = geometry.world_rects();
         let mut view = BoardView::new();
         view.drag = Some(NoteDrag {
@@ -1714,7 +1912,7 @@ mod tests {
         let child = add_note(&mut store, "child", Some(&root));
         let grandchild = add_note(&mut store, "grandchild", Some(&child));
         let board = Board::load(store.connection()).expect("load");
-        let geometry = Geometry::build(&board, 0);
+        let geometry = Geometry::build(&board, 0, false);
         let rects = geometry.world_rects();
         let mut view = BoardView::new();
         view.drag = Some(NoteDrag {
@@ -1779,7 +1977,7 @@ mod tests {
             .edges[0]
             .clone();
         let board = Board::load(store.connection()).expect("load");
-        let geometry = Geometry::build(&board, 0);
+        let geometry = Geometry::build(&board, 0, false);
         let camera = Camera::default();
         let canvas = Rect::from_min_max(pos2(0.0, 0.0), pos2(1280.0, 800.0));
         let edge_note = board.edge(&edge).expect("edge");
@@ -1841,6 +2039,47 @@ mod tests {
     }
 
     #[test]
+    fn toggle_done_completes_open_targets_or_reopens_all_done_ones() {
+        let mut store = store("board-toggle-done");
+        let (_, first) = board_and_root(&mut store);
+        let second = add_note(&mut store, "second", Some(&first));
+        store
+            .apply(
+                &[Command::Complete { id: second.clone() }],
+                crate::command::Actor::Human,
+                None,
+            )
+            .expect("complete");
+        let board = Board::load(store.connection()).expect("load");
+        let mixed = toggle_done_commands(&board, &[first.clone(), second.clone()]);
+        assert!(matches!(mixed.as_slice(), [Command::Complete { id }] if *id == first));
+        let done = toggle_done_commands(&board, std::slice::from_ref(&second));
+        assert!(matches!(done.as_slice(), [Command::Reopen { id }] if *id == second));
+        assert_eq!(child_progress(&board, &first), Some((1, 1)));
+        assert_eq!(child_progress(&board, &second), None);
+    }
+
+    #[test]
+    fn hide_done_keeps_a_done_container_with_open_children() {
+        let mut store = store("board-hide-done");
+        let (_, root) = board_and_root(&mut store);
+        let child = add_note(&mut store, "child", Some(&root));
+        store
+            .apply(
+                &[Command::Complete { id: root.clone() }],
+                crate::command::Actor::Human,
+                None,
+            )
+            .expect("complete");
+        let board = Board::load(store.connection()).expect("load");
+        let geometry = Geometry::build(&board, 0, true);
+        assert!(geometry.world_rect(&root).is_some(), "it has an open child");
+        assert!(geometry.world_rect(&child).is_some());
+        let shown = Geometry::build(&board, 0, false);
+        assert!(shown.world_rect(&root).is_some());
+    }
+
+    #[test]
     fn pinned_note_stays_at_its_stored_position() {
         let mut store = store("board-pinned");
         let (_, root) = board_and_root(&mut store);
@@ -1856,7 +2095,7 @@ mod tests {
             )
             .expect("pin");
         let board = Board::load(store.connection()).expect("load");
-        let geometry = Geometry::build(&board, 0);
+        let geometry = Geometry::build(&board, 0, false);
         let rect = geometry.world_rect(&root).expect("rect");
         assert!((rect.min.x - 123.0).abs() < 0.01);
         assert!((rect.min.y - 456.0).abs() < 0.01);
@@ -1867,13 +2106,14 @@ mod tests {
         let mut store = store("board-hit");
         let (_, root) = board_and_root(&mut store);
         let board = Board::load(store.connection()).expect("load");
-        let geometry = Geometry::build(&board, 0);
+        let geometry = Geometry::build(&board, 0, false);
         let view = BoardView::new();
         let canvas = Rect::from_min_max(pos2(0.0, 0.0), pos2(1280.0, 800.0));
         let context = BoardContext {
             board: &board,
             now_utc_ms: 0,
             tz: TZ,
+            hide_done: false,
         };
         let screen = geometry
             .screen_rect(&root, &view.camera, canvas)
@@ -1893,7 +2133,7 @@ mod tests {
         let mut store = store("board-ids");
         let (_, root) = board_and_root(&mut store);
         let board = Board::load(store.connection()).expect("load");
-        let geometry = Geometry::build(&board, 0);
+        let geometry = Geometry::build(&board, 0, false);
         let number = geometry.num(&root).expect("number");
         assert_eq!(geometry.note_by_num[&number], root);
         assert_eq!(geometry.num_by_note.len(), board.notes.len());

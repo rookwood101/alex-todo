@@ -68,10 +68,12 @@ all three binaries:
 | Shift+click | Add to or remove from the selection |
 | Drag on empty canvas | Select the notes inside the box |
 | Ctrl+A | Select all notes |
+| Click a note's checkbox / Ctrl+Enter | Toggle done (Ctrl+Enter acts on the selection) |
+| Hide done (toolbar) | Hide done notes that have no open children |
 | Delete or Backspace | Delete the selection (containers take their children); Undo is offered |
 | Drag a note | Move a root note (pins it) or reparent a child by dropping it on a container |
 | Drag the dot on a selected note | Link it to another note |
-| Right-click a note | Edit, mark done, snooze, unsnooze, delete (acts on the whole selection) |
+| Right-click a note | Edit, mark done/reopen, snooze, unsnooze, delete (acts on the whole selection) |
 | Tab (composer) | Switch Capture / Agent |
 | Enter (composer) | Create the note / send the prompt |
 | Shift+Enter | New line in the composer |

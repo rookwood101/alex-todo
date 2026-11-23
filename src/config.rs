@@ -52,6 +52,8 @@ pub struct Config {
     pub pi_profile: Profile,
     /// Reminder poll interval.
     pub reminder_minutes: u64,
+    /// Hide done notes that have no open descendants.
+    pub hide_done: bool,
 }
 
 impl Default for Config {
@@ -64,6 +66,7 @@ impl Default for Config {
             pi_provider: "deepseek".to_owned(),
             pi_profile: Profile::Board,
             reminder_minutes: 30,
+            hide_done: false,
         }
     }
 }
