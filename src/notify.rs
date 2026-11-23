@@ -48,24 +48,48 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+#[cfg(windows)]
 use tauri_winrt_notification::{Duration, Sound, Toast};
+#[cfg(windows)]
 use windows::Win32::Foundation::{ERROR_SUCCESS, RPC_E_CHANGED_MODE, S_FALSE, S_OK};
+#[cfg(windows)]
 use windows::Win32::Storage::EnhancedStorage::PKEY_AppUserModel_ID;
+#[cfg(windows)]
 use windows::Win32::System::Com::StructuredStorage::{
     PROPVARIANT, PROPVARIANT_0, PROPVARIANT_0_0, PROPVARIANT_0_0_0,
 };
+#[cfg(windows)]
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
     CoTaskMemAlloc, CoUninitialize, IPersistFile,
 };
+#[cfg(windows)]
 use windows::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey,
     RegCreateKeyExW, RegSetValueExW,
 };
+#[cfg(windows)]
 use windows::Win32::System::Variant::VT_LPWSTR;
+#[cfg(windows)]
 use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
+#[cfg(windows)]
 use windows::Win32::UI::Shell::{IShellLinkW, SetCurrentProcessExplicitAppUserModelID, ShellLink};
+#[cfg(windows)]
 use windows::core::{HSTRING, Interface, PCWSTR, PWSTR};
+
+/// Native error type of the Windows shell calls.
+#[cfg(windows)]
+pub type WinError = windows::core::Error;
+/// Stand-in for the Windows error type on other platforms (tests only).
+#[cfg(not(windows))]
+pub type WinError = io::Error;
+
+/// Native error type of the toast library.
+#[cfg(windows)]
+pub type ToastError = tauri_winrt_notification::Error;
+/// Stand-in for the toast error type on other platforms (tests only).
+#[cfg(not(windows))]
+pub type ToastError = io::Error;
 
 /// The AppUserModelID shared by the shortcut, the registry key and the toast.
 pub const AUMID: &str = "com.rustboard.app";
@@ -151,11 +175,11 @@ pub enum NotifyError {
 
     /// Per-thread COM initialization failed.
     #[error("cannot initialize COM: {0}")]
-    ComInit(#[source] windows::core::Error),
+    ComInit(#[source] WinError),
 
     /// A Windows shell/COM call failed.
     #[error("Windows shell error: {0}")]
-    Shell(#[from] windows::core::Error),
+    Shell(#[from] WinError),
 
     /// A specific shortcut-registration step failed.
     #[error("Windows shell error during {step}: {source}")]
@@ -164,16 +188,16 @@ pub enum NotifyError {
         step: &'static str,
         /// Underlying Windows error.
         #[source]
-        source: windows::core::Error,
+        source: WinError,
     },
 
     /// SetCurrentProcessExplicitAppUserModelID failed.
     #[error("cannot set the process AppUserModelID: {0}")]
-    ProcessAppId(#[source] windows::core::Error),
+    ProcessAppId(#[source] WinError),
 
     /// The HKCU AppUserModelId registration key could not be written.
     #[error("cannot write the AppUserModelId registry key: {0}")]
-    Registry(#[source] windows::core::Error),
+    Registry(#[source] WinError),
 
     /// Converting the AUMID to a native property value ran out of memory.
     #[error("out of memory while preparing the notification property")]
@@ -195,7 +219,7 @@ pub enum NotifyError {
 
     /// The real toast was rejected by Windows.
     #[error("toast failed: {0}")]
-    Show(#[source] tauri_winrt_notification::Error),
+    Show(#[source] ToastError),
 
     /// An injected fallback failed.
     #[error("notification fallback failed: {message}")]
@@ -402,6 +426,7 @@ impl Registration {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WinRtBackend;
 
+#[cfg(windows)]
 impl ToastBackend for WinRtBackend {
     fn show(&self, notification: &Notification) -> Result<(), NotifyError> {
         let title = match notification.title.trim() {
@@ -457,6 +482,7 @@ impl FallbackNotifier for DefaultFallback {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ShellShortcutRegistrar;
 
+#[cfg(windows)]
 impl ShortcutRegistrar for ShellShortcutRegistrar {
     fn write_shortcut(
         &self,
@@ -549,6 +575,7 @@ impl ShortcutRegistrar for ShellShortcutRegistrar {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ShellAppIdRegistrar;
 
+#[cfg(windows)]
 impl AppIdRegistrar for ShellAppIdRegistrar {
     fn register_app_id(&self) -> Result<(), NotifyError> {
         let key_path = app_id_registry_key();
@@ -707,6 +734,7 @@ impl Notifier for ToastNotifier {
 /// 170 calls this at startup so the tray and taskbar group under the same
 /// identity as the toasts. Repeated calls after a success are no-ops; a failed
 /// call is retried by the next caller.
+#[cfg(windows)]
 pub fn ensure_app_id() -> Result<(), NotifyError> {
     static PROCESS_APP_ID_SET: AtomicBool = AtomicBool::new(false);
     if PROCESS_APP_ID_SET.load(Ordering::Acquire) {
@@ -718,6 +746,46 @@ pub fn ensure_app_id() -> Result<(), NotifyError> {
     unsafe { SetCurrentProcessExplicitAppUserModelID(&app_id) }
         .map_err(NotifyError::ProcessAppId)?;
     PROCESS_APP_ID_SET.store(true, Ordering::Release);
+    Ok(())
+}
+
+/// Toasts are Windows-only; other platforms report that plainly.
+#[cfg(not(windows))]
+fn unsupported() -> NotifyError {
+    NotifyError::Backend {
+        message: "toast notifications need Windows".to_owned(),
+    }
+}
+
+#[cfg(not(windows))]
+impl ToastBackend for WinRtBackend {
+    fn show(&self, _notification: &Notification) -> Result<(), NotifyError> {
+        Err(unsupported())
+    }
+}
+
+#[cfg(not(windows))]
+impl ShortcutRegistrar for ShellShortcutRegistrar {
+    fn write_shortcut(
+        &self,
+        _shortcut: &Path,
+        _target: &Path,
+        _icon: Option<&Path>,
+    ) -> Result<(), NotifyError> {
+        Err(unsupported())
+    }
+}
+
+#[cfg(not(windows))]
+impl AppIdRegistrar for ShellAppIdRegistrar {
+    fn register_app_id(&self) -> Result<(), NotifyError> {
+        Err(unsupported())
+    }
+}
+
+/// No process identity exists off Windows; nothing to set.
+#[cfg(not(windows))]
+pub fn ensure_app_id() -> Result<(), NotifyError> {
     Ok(())
 }
 
@@ -759,6 +827,7 @@ fn default_icon_path(exe: &Path) -> Option<PathBuf> {
 }
 
 /// Owned VT_LPWSTR property value allocated with the COM task allocator.
+#[cfg(windows)]
 fn propvariant_from_str(value: &str) -> Result<PROPVARIANT, NotifyError> {
     let mut wide: Vec<u16> = value.encode_utf16().collect();
     wide.push(0);
@@ -793,10 +862,12 @@ fn propvariant_from_str(value: &str) -> Result<PROPVARIANT, NotifyError> {
 }
 
 /// RAII guard for a per-thread COM apartment.
+#[cfg(windows)]
 struct ComApartment {
     uninitialize: bool,
 }
 
+#[cfg(windows)]
 impl ComApartment {
     fn initialize() -> Result<Self, NotifyError> {
         // SAFETY: per-thread COM initialization; the guard uninitializes on Drop.
@@ -819,6 +890,7 @@ impl ComApartment {
     }
 }
 
+#[cfg(windows)]
 impl Drop for ComApartment {
     fn drop(&mut self) {
         if self.uninitialize {
@@ -829,8 +901,10 @@ impl Drop for ComApartment {
 }
 
 /// RAII guard for an HKEY.
+#[cfg(windows)]
 struct RegKey(HKEY);
 
+#[cfg(windows)]
 impl Drop for RegKey {
     fn drop(&mut self) {
         // SAFETY: self.0 came from RegCreateKeyExW and is closed exactly once.

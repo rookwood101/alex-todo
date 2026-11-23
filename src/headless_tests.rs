@@ -3,7 +3,9 @@
 //! Each test drives the real [RustboardApp] with an egui context and a private
 //! SQLite board in target/test-tmp. No window, no network and no live model.
 
-use eframe::egui::{Context, Event, Key, Modifiers, Pos2, RawInput, Rect, vec2};
+use eframe::egui::{
+    Context, Event, Key, Modifiers, PointerButton, Pos2, RawInput, Rect, pos2, vec2,
+};
 
 use crate::app::RustboardApp;
 use crate::command::{Actor, Command};
@@ -13,12 +15,21 @@ use crate::store::{StorePaths, schema, scratch_dir};
 use crate::theme;
 
 const FRAME_SECONDS: f64 = 1.0 / 60.0;
+/// Ctrl as egui-winit reports it on Windows (ctrl and command both set).
+const CTRL: Modifiers = Modifiers {
+    alt: false,
+    ctrl: true,
+    shift: false,
+    mac_cmd: false,
+    command: true,
+};
 
 struct Headless {
     ctx: Context,
     app: RustboardApp,
     screen: Rect,
     time: f64,
+    modifiers: Modifiers,
 }
 
 impl Headless {
@@ -35,12 +46,14 @@ impl Headless {
             app,
             screen: Rect::from_min_size(Pos2::ZERO, vec2(1280.0, 800.0)),
             time: 0.0,
+            modifiers: Modifiers::NONE,
         };
         headless.run_frame(Vec::new());
         headless
     }
 
-    fn run_frame(&mut self, events: Vec<Event>) {
+    fn run_frame(&mut self, mut events: Vec<Event>) {
+        events.insert(0, Event::ModifiersChanged(self.modifiers));
         self.time += FRAME_SECONDS;
         let raw = RawInput {
             screen_rect: Some(self.screen),
@@ -55,13 +68,77 @@ impl Headless {
     }
 
     fn key(&mut self, key: Key) {
+        self.key_with(key, Modifiers::NONE);
+    }
+
+    fn key_with(&mut self, key: Key, modifiers: Modifiers) {
+        self.modifiers = modifiers;
         self.run_frame(vec![Event::Key {
             key,
             physical_key: None,
             pressed: true,
             repeat: false,
-            modifiers: Modifiers::NONE,
+            modifiers,
         }]);
+        self.modifiers = Modifiers::NONE;
+        self.run_frame(Vec::new());
+    }
+
+    fn pointer(&mut self, pos: Pos2, pressed: bool, modifiers: Modifiers) {
+        self.modifiers = modifiers;
+        self.run_frame(vec![
+            Event::PointerMoved(pos),
+            Event::PointerButton {
+                pos,
+                button: PointerButton::Primary,
+                pressed,
+                modifiers,
+            },
+        ]);
+    }
+
+    /// Press and release at one point, then settle one frame. The time step
+    /// keeps two clicks from counting as a double-click.
+    fn click_with(&mut self, pos: Pos2, modifiers: Modifiers) {
+        self.time += 1.0;
+        self.pointer(pos, true, modifiers);
+        self.pointer(pos, false, modifiers);
+        self.run_frame(Vec::new());
+    }
+
+    fn click(&mut self, pos: Pos2) {
+        self.click_with(pos, Modifiers::NONE);
+    }
+
+    fn drag(&mut self, from: Pos2, to: Pos2) {
+        self.time += 1.0;
+        self.pointer(from, true, Modifiers::NONE);
+        for step in 1..=4 {
+            let t = step as f32 / 4.0;
+            self.run_frame(vec![Event::PointerMoved(from + (to - from) * t)]);
+        }
+        self.pointer(to, false, Modifiers::NONE);
+        self.run_frame(Vec::new());
+    }
+
+    fn type_text(&mut self, text: &str) {
+        self.run_frame(vec![Event::Text(text.to_owned())]);
+    }
+
+    fn note_rect(&self, id: &str) -> Rect {
+        self.app
+            .view
+            .screen_rect_for(&self.app.board, id, self.app.canvas_rect)
+            .expect("note is on screen")
+    }
+
+    fn note_ids(&self) -> Vec<String> {
+        self.app
+            .board
+            .notes
+            .iter()
+            .map(|note| note.id.clone())
+            .collect()
     }
 }
 
@@ -199,18 +276,122 @@ fn a_leftover_board_ron_is_ignored() {
 }
 
 #[test]
-fn delete_on_a_selected_note_does_not_delete_it() {
-    let mut headless = Headless::new("app-no-delete");
-    add_note(&mut headless.app, "keep me");
-    let id = headless.app.board.notes[0].id.clone();
-    headless.app.view.selected = Some(id);
+fn a_click_selects_and_a_second_click_edits() {
+    let mut headless = Headless::new("app-click-select");
+    add_note(&mut headless.app, "first");
     headless.run_frame(Vec::new());
-    headless.key(Key::Delete);
+    let id = headless.note_ids()[0].clone();
+    let center = headless.note_rect(&id).center();
+
+    headless.click(center);
+    assert_eq!(headless.app.view.selected, vec![id.clone()]);
+    assert!(!headless.app.view.is_editing(), "one click only selects");
+
+    headless.click(center);
+    assert_eq!(headless.app.view.editing_note(), Some(&id));
+}
+
+#[test]
+fn escape_saves_the_edit_then_clears_the_selection() {
+    let mut headless = Headless::new("app-escape-saves");
+    add_note(&mut headless.app, "old");
+    headless.run_frame(Vec::new());
+    let id = headless.note_ids()[0].clone();
+    headless.app.view.edit_note(&headless.app.board, id.clone());
+    headless.run_frame(Vec::new());
+    headless.run_frame(Vec::new());
+    headless.type_text(" text");
+
+    headless.key(Key::Escape);
+    assert!(!headless.app.view.is_editing());
+    assert_eq!(headless.app.board.note(&id).expect("note").text, "old text");
     assert_eq!(
-        headless.app.board.notes.len(),
-        1,
-        "there is no delete affordance in the app"
+        headless.app.view.selected,
+        vec![id],
+        "the first Escape only leaves the editor"
     );
+
+    headless.key(Key::Escape);
+    assert!(headless.app.view.selected.is_empty());
+}
+
+#[test]
+fn delete_removes_the_selection_and_undo_restores_it() {
+    let mut headless = Headless::new("app-delete");
+    add_note(&mut headless.app, "doomed");
+    add_note(&mut headless.app, "keep");
+    headless.run_frame(Vec::new());
+    let doomed = headless
+        .app
+        .board
+        .notes
+        .iter()
+        .find(|note| note.text == "doomed")
+        .expect("note")
+        .id
+        .clone();
+    headless.click(headless.note_rect(&doomed).center());
+    headless.key(Key::Delete);
+    assert_eq!(headless.app.board.notes.len(), 1);
+    assert!(headless.app.board.note(&doomed).is_none());
+
+    headless.key_with(Key::Z, CTRL);
+    assert!(
+        headless.app.board.note(&doomed).is_some(),
+        "undo restores it"
+    );
+}
+
+#[test]
+fn backspace_also_deletes_but_not_while_editing() {
+    let mut headless = Headless::new("app-backspace");
+    add_note(&mut headless.app, "text");
+    headless.run_frame(Vec::new());
+    let id = headless.note_ids()[0].clone();
+    let center = headless.note_rect(&id).center();
+
+    headless.click(center);
+    headless.click(center);
+    assert!(headless.app.view.is_editing());
+    headless.key(Key::Backspace);
+    headless.key(Key::Delete);
+    assert_eq!(headless.app.board.notes.len(), 1, "keys edit the text");
+
+    headless.key(Key::Escape);
+    headless.key(Key::Backspace);
+    assert!(headless.app.board.notes.is_empty());
+}
+
+#[test]
+fn a_box_drag_and_shift_click_build_a_multi_selection() {
+    let mut headless = Headless::new("app-marquee");
+    add_note(&mut headless.app, "a");
+    add_note(&mut headless.app, "b");
+    headless.run_frame(Vec::new());
+    let ids = headless.note_ids();
+    let first = headless.note_rect(&ids[0]);
+    let second = headless.note_rect(&ids[1]);
+    let all = first.union(second);
+
+    headless.drag(all.min - vec2(20.0, 20.0), all.max + vec2(20.0, 20.0));
+    let mut selected = headless.app.view.selected.clone();
+    selected.sort();
+    let mut expected = ids.clone();
+    expected.sort();
+    assert_eq!(selected, expected, "the box selects both notes");
+
+    headless.click(first.center());
+    assert_eq!(
+        headless.app.view.selected.len(),
+        2,
+        "clicking a member keeps the group"
+    );
+    headless.click_with(first.center(), Modifiers::SHIFT);
+    assert_eq!(headless.app.view.selected, vec![ids[1].clone()]);
+
+    let empty = pos2(all.max.x + 150.0, all.center().y);
+    headless.click(empty);
+    assert!(headless.app.view.selected.is_empty(), "empty canvas clears");
 }
 
 #[test]

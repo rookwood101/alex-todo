@@ -39,6 +39,8 @@ struct StatusMessage {
     text: String,
     error: bool,
     at: Instant,
+    /// Show an Undo button that undoes the last batch.
+    undo: bool,
 }
 
 /// Notification sink for the reminder engine.
@@ -102,7 +104,7 @@ pub struct RustboardApp {
     pub(crate) view: BoardView,
     pub(crate) composer: ComposerState,
     pub(crate) chat: ChatState,
-    canvas_rect: egui::Rect,
+    pub(crate) canvas_rect: egui::Rect,
     harness: Option<Arc<dyn AgentHarness>>,
     agent_events: Option<Receiver<AgentEvent>>,
     agent_profile: PiProfile,
@@ -391,6 +393,17 @@ impl RustboardApp {
             text: text.into(),
             error,
             at: Instant::now(),
+            undo: false,
+        });
+    }
+
+    /// A status banner with an Undo button for the batch just applied.
+    fn set_undoable_status(&mut self, text: impl Into<String>) {
+        self.status = Some(StatusMessage {
+            text: text.into(),
+            error: false,
+            at: Instant::now(),
+            undo: true,
         });
     }
 
@@ -573,8 +586,19 @@ impl RustboardApp {
     }
 
     fn apply_board_output(&mut self, output: BoardOutput) {
-        if !output.commands.is_empty() {
-            self.apply_commands(output.commands, "canvas");
+        if output.commands.is_empty() {
+            return;
+        }
+        let before = self.board.notes.len();
+        let label = if output.deleted_notes > 0 {
+            "delete"
+        } else {
+            "canvas"
+        };
+        if self.apply_commands(output.commands, label).is_some() && output.deleted_notes > 0 {
+            let removed = before.saturating_sub(self.board.notes.len());
+            let noun = if removed == 1 { "note" } else { "notes" };
+            self.set_undoable_status(format!("Deleted {removed} {noun}"));
         }
     }
 
@@ -835,10 +859,16 @@ impl RustboardApp {
         let Some(status) = &self.status else {
             return;
         };
-        if status.at.elapsed() > Duration::from_secs(STATUS_SECONDS) {
+        let seconds = if status.undo {
+            STATUS_SECONDS * 2
+        } else {
+            STATUS_SECONDS
+        };
+        if status.at.elapsed() > Duration::from_secs(seconds) {
             self.status = None;
             return;
         }
+        let mut undo_clicked = false;
         egui::Area::new(egui::Id::unique("status_banner"))
             .anchor(Align2::RIGHT_TOP, vec2(-12.0, 66.0))
             .show(ctx, |ui| {
@@ -848,17 +878,28 @@ impl RustboardApp {
                     .corner_radius(8)
                     .inner_margin(egui::Margin::symmetric(10, 6))
                     .show(ui, |ui| {
-                        ui.label(
-                            RichText::new(&status.text)
-                                .size(12.0)
-                                .color(if status.error {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(&status.text).size(12.0).color(
+                                if status.error {
                                     theme::SAVE_ERROR
                                 } else {
                                     theme::SAVE_OK
-                                }),
-                        );
+                                },
+                            ));
+                            if status.undo
+                                && ui
+                                    .button(RichText::new("Undo").size(12.0))
+                                    .on_hover_text("Ctrl+Z")
+                                    .clicked()
+                            {
+                                undo_clicked = true;
+                            }
+                        });
                     });
             });
+        if undo_clicked {
+            self.undo();
+        }
         ctx.request_repaint_after(Duration::from_millis(250));
     }
 
