@@ -62,18 +62,23 @@ all three binaries:
 | Input | Action |
 |---|---|
 | Scroll wheel | Zoom under the pointer |
-| Right- or middle-drag | Pan the canvas |
-| Drag a note header | Move a root note (pins it) or reparent a child by dropping it on a container |
-| Click note text | Edit it inline |
-| Right-click a note | Mark done, snooze one hour/tomorrow, unsnooze |
+| Right-drag, middle-drag or Space+drag | Pan the canvas |
+| Click a note or arrow | Select it |
+| Click a selected note, double-click or Enter | Edit the note inline |
+| Shift+click | Add to or remove from the selection |
+| Drag on empty canvas | Select the notes inside the box |
+| Ctrl+A | Select all notes |
+| Delete or Backspace | Delete the selection (containers take their children); Undo is offered |
+| Drag a note | Move a root note (pins it) or reparent a child by dropping it on a container |
+| Drag the dot on a selected note | Link it to another note |
+| Right-click a note | Edit, mark done, snooze, unsnooze, delete (acts on the whole selection) |
 | Tab (composer) | Switch Capture / Agent |
 | Enter (composer) | Create the note / send the prompt |
 | Shift+Enter | New line in the composer |
-| Esc | Leave editing; when nothing is focused, hide to the tray |
+| Esc | Save and leave the editor, then clear the selection, then hide to the tray |
 | Ctrl+Space | Show and focus the window (configurable in Settings) |
 | Ctrl+N | New note in the Inbox |
 | Ctrl+Z / Ctrl+Shift+Z | Undo / redo |
-| Delete | With an arrow selected, unlink it (there is no delete-note shortcut) |
 
 Capture examples: <code>buy milk tomorrow 4pm #home !high</code>,
 <code>pay rent by friday</code>, <code>call #work !low</code>,

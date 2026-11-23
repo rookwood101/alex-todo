@@ -5,21 +5,27 @@
 //! It owns no database handle: the app applies the returned commands through
 //! [crate::command::Store::apply] and reloads.
 //!
-//! Interaction rules from the brief:
-//! * root notes pin where they are dropped;
-//! * child notes reparent when dropped over a container, otherwise they move to
-//!   the root;
-//! * a drop on the note itself or one of its descendants is rejected;
-//! * a selected note shows a link handle; drag it onto another note to link;
-//! * a selected arrow is removed with Delete;
-//! * done notes are not painted; snoozed notes are painted at 35% opacity;
-//! * there is no delete affordance for notes here (task 170 owns the toolbar).
+//! Interaction rules:
+//! * a click selects a note; a click on an already selected note, a
+//!   double-click or Enter opens the inline editor;
+//! * Shift+click adds or removes a note or arrow; a left-drag on empty canvas
+//!   draws a selection box; Ctrl+A selects every visible note;
+//! * Delete or Backspace soft-deletes the selection (subtrees included);
+//! * Escape saves and closes the editor, then clears the selection; the app
+//!   hides the window only when the board did not use the key;
+//! * right-drag, middle-drag or Space+left-drag pans;
+//! * root notes pin where they are dropped; child notes reparent when dropped
+//!   over a container, otherwise they move to the root; a drop on the note
+//!   itself or one of its descendants is rejected;
+//! * a single selected note shows a link handle; drag it onto another note to
+//!   link;
+//! * done notes are not painted; snoozed notes are painted at 35% opacity.
 
 use std::collections::HashMap;
 
 use eframe::egui::{
-    self, Align2, Color32, CursorIcon, FontId, PointerButton, Pos2, Rect, Sense, Stroke,
-    StrokeKind, Ui, Vec2, pos2, vec2,
+    self, Align2, Color32, CursorIcon, FontId, Key, Modifiers, PointerButton, Pos2, Rect, RichText,
+    Sense, Stroke, StrokeKind, Ui, Vec2, pos2, vec2,
 };
 
 use crate::camera::Camera;
@@ -55,6 +61,9 @@ pub struct BoardOutput {
     pub canvas_rect: Rect,
     /// True while a note is being edited inline (the app defers reloads).
     pub editing: bool,
+    /// Notes the frame asked to delete (roots of the deleted subtrees). The app
+    /// uses it to offer Undo.
+    pub deleted_notes: usize,
 }
 
 impl Default for BoardOutput {
@@ -63,6 +72,7 @@ impl Default for BoardOutput {
             commands: Vec::new(),
             canvas_rect: Rect::ZERO,
             editing: false,
+            deleted_notes: 0,
         }
     }
 }
@@ -70,8 +80,11 @@ impl Default for BoardOutput {
 /// The camera and the interaction state that survives between frames.
 pub struct BoardView {
     pub camera: Camera,
-    pub selected: Option<NoteId>,
-    pub selected_edge: Option<EdgeId>,
+    /// Selected notes, in selection order.
+    pub selected: Vec<NoteId>,
+    /// Selected arrows, in selection order.
+    pub selected_edges: Vec<EdgeId>,
+    marquee: Option<Marquee>,
     editing: Option<NoteId>,
     edit_buffer: String,
     focus_requested: Option<NoteId>,
@@ -88,6 +101,20 @@ struct NoteDrag {
     /// Pointer offset from the note's top-left, in world units.
     grab: Vec2,
     moved: bool,
+    /// The note was already the only selection when the press started, so a
+    /// click without movement opens the editor.
+    reselect: bool,
+}
+
+/// A selection box drawn by a left-drag on empty canvas.
+#[derive(Clone, Debug)]
+struct Marquee {
+    /// Press position in screen coordinates.
+    origin: Pos2,
+    /// Shift was held: the box adds to the existing selection.
+    additive: bool,
+    /// The selection when the drag started (kept for additive boxes).
+    base: Vec<NoteId>,
 }
 
 #[derive(Clone, Debug)]
@@ -105,8 +132,9 @@ impl BoardView {
     pub fn new() -> Self {
         Self {
             camera: Camera::default(),
-            selected: None,
-            selected_edge: None,
+            selected: Vec::new(),
+            selected_edges: Vec::new(),
+            marquee: None,
             editing: None,
             edit_buffer: String::new(),
             focus_requested: None,
@@ -147,18 +175,53 @@ impl BoardView {
         self.camera = camera;
     }
 
+    /// The single selected note, if exactly one note and no arrow is selected.
+    pub fn single_selected(&self) -> Option<&NoteId> {
+        match (self.selected.as_slice(), self.selected_edges.is_empty()) {
+            ([only], true) => Some(only),
+            _ => None,
+        }
+    }
+
+    pub fn is_selected(&self, id: &str) -> bool {
+        self.selected.iter().any(|selected| selected == id)
+    }
+
+    /// Replace the selection with one note.
+    pub fn select_only(&mut self, id: NoteId) {
+        self.selected = vec![id];
+        self.selected_edges.clear();
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selected.clear();
+        self.selected_edges.clear();
+    }
+
+    fn toggle_note(&mut self, id: NoteId) {
+        if let Some(index) = self.selected.iter().position(|selected| *selected == id) {
+            self.selected.remove(index);
+        } else {
+            self.selected.push(id);
+        }
+    }
+
+    fn toggle_edge(&mut self, id: EdgeId) {
+        if let Some(index) = self.selected_edges.iter().position(|edge| *edge == id) {
+            self.selected_edges.remove(index);
+        } else {
+            self.selected_edges.push(id);
+        }
+    }
+
     /// Clear transient state after a board reload.
     pub fn after_reload(&mut self, board: &Board) {
-        if let Some(id) = &self.selected
-            && board.note(id).is_none()
-        {
-            self.selected = None;
-        }
-        if let Some(id) = &self.selected_edge
-            && board.edge(id).is_none()
-        {
-            self.selected_edge = None;
-        }
+        self.selected.retain(|id| {
+            board
+                .note(id)
+                .is_some_and(|note| note.status != Status::Done)
+        });
+        self.selected_edges.retain(|id| board.edge(id).is_some());
         if let Some(id) = &self.editing
             && board.note(id).is_none()
         {
@@ -168,14 +231,19 @@ impl BoardView {
 
     /// Start editing a note's text.
     pub fn edit_note(&mut self, board: &Board, id: NoteId) {
-        self.selected = Some(id.clone());
-        self.selected_edge = None;
+        self.select_only(id.clone());
         self.editing = Some(id.clone());
         self.edit_buffer = board
             .note(&id)
             .map(|note| note.text.clone())
             .unwrap_or_default();
         self.focus_requested = Some(id);
+    }
+
+    /// Screen rect of a note for the given canvas (test seam for the app tests).
+    #[cfg(test)]
+    pub(crate) fn screen_rect_for(&self, board: &Board, id: &str, canvas: Rect) -> Option<Rect> {
+        Geometry::build(board, 0).screen_rect(id, &self.camera, canvas)
     }
 
     /// Draw the board and return the commands the input produced.
@@ -190,7 +258,7 @@ impl BoardView {
             return output;
         }
 
-        let (canvas_rect, background) = ui.allocate_exact_size(available, Sense::click());
+        let (canvas_rect, _background) = ui.allocate_exact_size(available, Sense::click());
         if canvas_rect.width() < 1.0 || canvas_rect.height() < 1.0 {
             return output;
         }
@@ -209,9 +277,9 @@ impl BoardView {
 
         self.handle_wheel(ui, canvas_rect);
         self.handle_pan(ui, canvas_rect);
+        self.handle_keys(ui, context, &mut output);
         self.handle_note_input(ui, context, &geometry, canvas_rect, &mut output);
         self.handle_link_input(ui, context, &geometry, canvas_rect, &mut output);
-        self.handle_edge_input(ui, context, &mut output);
 
         let painter = ui.painter_at(canvas_rect);
         painter.rect_filled(canvas_rect, 0, theme::CANVAS_BG);
@@ -222,11 +290,12 @@ impl BoardView {
             &geometry,
             &self.camera,
             canvas_rect,
-            self.selected_edge.as_deref(),
+            &self.selected_edges,
         );
         self.paint_notes(ui, &painter, context, &geometry, canvas_rect, &mut output);
         self.paint_link_hint(ui, context, &geometry, canvas_rect);
         self.paint_drop_hint(ui, &geometry, canvas_rect);
+        self.paint_marquee(ui, canvas_rect);
 
         if context.board.notes.is_empty() {
             painter.text(
@@ -245,24 +314,6 @@ impl BoardView {
             );
         }
 
-        if let Some(pointer) = ui.input(|input| input.pointer.interact_pos())
-            && background.clicked()
-            && self
-                .hit_note(&geometry, context, pointer, canvas_rect)
-                .is_none()
-        {
-            if let Some(edge) =
-                hit_edge(context.board, &geometry, &self.camera, canvas_rect, pointer)
-            {
-                self.selected_edge = Some(edge);
-                self.selected = None;
-            } else {
-                self.selected = None;
-                self.selected_edge = None;
-                surrender_focus(ui.ctx());
-            }
-        }
-
         if self.drag.is_some() || self.pan_button.is_some() {
             ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
         }
@@ -275,7 +326,7 @@ impl BoardView {
         let Some(pointer) = ui.input(|input| input.pointer.hover_pos()) else {
             return;
         };
-        if !canvas_rect.contains(pointer) {
+        if !canvas_rect.contains(pointer) || !on_board_layer(ui, pointer) {
             return;
         }
         let scroll = ui.ctx().input_mut(|input| {
@@ -292,23 +343,43 @@ impl BoardView {
     }
 
     fn handle_pan(&mut self, ui: &mut Ui, canvas_rect: Rect) {
-        let (secondary_pressed, middle_pressed, secondary_down, middle_down, pointer, delta) = ui
-            .input(|input| {
-                (
-                    input.pointer.button_pressed(PointerButton::Secondary),
-                    input.pointer.button_pressed(PointerButton::Middle),
-                    input.pointer.secondary_down(),
-                    input.pointer.middle_down(),
-                    input.pointer.latest_pos(),
-                    input.pointer.delta(),
-                )
-            });
+        let typing = ui.ctx().memory(|memory| memory.focused().is_some());
+        let (
+            primary_pressed,
+            secondary_pressed,
+            middle_pressed,
+            primary_down,
+            secondary_down,
+            middle_down,
+            space_down,
+            pointer,
+            delta,
+        ) = ui.input(|input| {
+            (
+                input.pointer.button_pressed(PointerButton::Primary),
+                input.pointer.button_pressed(PointerButton::Secondary),
+                input.pointer.button_pressed(PointerButton::Middle),
+                input.pointer.primary_down(),
+                input.pointer.secondary_down(),
+                input.pointer.middle_down(),
+                input.key_down(egui::Key::Space),
+                input.pointer.latest_pos(),
+                input.pointer.delta(),
+            )
+        });
+        let space_pan = space_down && !typing;
+        if space_pan && self.pan_button.is_none() {
+            ui.ctx().set_cursor_icon(CursorIcon::Grab);
+        }
 
         if self.pan_button.is_none()
             && let Some(pointer) = pointer
             && canvas_rect.contains(pointer)
+            && on_board_layer(ui, pointer)
         {
-            if secondary_pressed {
+            if primary_pressed && space_pan {
+                self.pan_button = Some(PointerButton::Primary);
+            } else if secondary_pressed {
                 self.pan_button = Some(PointerButton::Secondary);
             } else if middle_pressed {
                 self.pan_button = Some(PointerButton::Middle);
@@ -319,6 +390,7 @@ impl BoardView {
             return;
         };
         let still_down = match button {
+            PointerButton::Primary => primary_down,
             PointerButton::Secondary => secondary_down,
             PointerButton::Middle => middle_down,
             _ => false,
@@ -341,11 +413,13 @@ impl BoardView {
         canvas_rect: Rect,
         output: &mut BoardOutput,
     ) {
+        if self.pan_button.is_some() {
+            return;
+        }
         let pointer = ui.input(|input| input.pointer.interact_pos());
         let primary_down = ui.input(|input| input.pointer.primary_down());
         let primary_released =
             ui.input(|input| input.pointer.button_released(PointerButton::Primary));
-        let escape = ui.input(|input| input.key_pressed(egui::Key::Escape));
 
         if let Some(drag) = &mut self.drag {
             if primary_down {
@@ -359,23 +433,28 @@ impl BoardView {
                     {
                         drag.moved = true;
                     }
-                    self.drop_target = geometry.drop_target(
-                        context.board,
-                        &drag.id,
-                        world,
-                        &geometry.world_rects(),
-                    );
-                }
-            } else if primary_released {
-                if let Some(pointer) = pointer {
-                    let world = self.camera.screen_to_world(pointer, canvas_rect);
                     if drag.moved {
+                        self.drop_target = geometry.drop_target(
+                            context.board,
+                            &drag.id,
+                            world,
+                            &geometry.world_rects(),
+                        );
+                    }
+                }
+            } else {
+                let drag = drag.clone();
+                if drag.moved {
+                    if let Some(pointer) = pointer {
+                        let world = self.camera.screen_to_world(pointer, canvas_rect);
                         output.commands.extend(self.commit_note_drop(
                             context.board,
                             geometry,
                             world,
                         ));
                     }
+                } else if drag.reselect && primary_released {
+                    self.edit_note(context.board, drag.id.clone());
                 }
                 self.drag = None;
                 self.drop_target = None;
@@ -384,11 +463,26 @@ impl BoardView {
             return;
         }
 
-        if escape {
-            if self.editing.is_some() {
-                self.finish_edit(context.board, false, output);
+        if let Some(marquee) = self.marquee.clone() {
+            if primary_down {
+                if let Some(pointer) = pointer {
+                    let rect = Rect::from_two_pos(marquee.origin, pointer);
+                    let mut selection = if marquee.additive {
+                        marquee.base.clone()
+                    } else {
+                        Vec::new()
+                    };
+                    for id in self.notes_in_rect(geometry, context, rect, canvas_rect) {
+                        if !selection.contains(&id) {
+                            selection.push(id);
+                        }
+                    }
+                    self.selected = selection;
+                }
+                ui.ctx().request_repaint();
+            } else {
+                self.marquee = None;
             }
-            self.selected_edge = None;
             return;
         }
 
@@ -396,32 +490,130 @@ impl BoardView {
             self.finish_edit(context.board, true, output);
         }
 
-        if let Some(pointer) = pointer
-            && ui.input(|input| input.pointer.button_pressed(PointerButton::Primary))
-            && canvas_rect.contains(pointer)
-        {
-            if let Some(id) = self.hit_header(geometry, context, pointer, canvas_rect) {
-                let world = self.camera.screen_to_world(pointer, canvas_rect);
-                let note_rect = geometry
-                    .world_rect(&id)
-                    .unwrap_or_else(|| Rect::from_min_size(world, Vec2::ZERO));
-                self.drag = Some(NoteDrag {
-                    id: id.clone(),
-                    grab: world - note_rect.min,
-                    moved: false,
-                });
-                self.selected = Some(id);
-                self.selected_edge = None;
-                surrender_focus(ui.ctx());
-            } else if let Some(id) = self.hit_body(geometry, context, pointer, canvas_rect) {
-                if self.editing.as_deref() != Some(id.as_str()) {
-                    self.finish_edit(context.board, true, output);
-                    self.edit_note(context.board, id.clone());
-                }
-                self.selected = Some(id);
-                self.selected_edge = None;
-            }
+        let Some(pointer) = pointer else {
+            return;
+        };
+        if !canvas_rect.contains(pointer) || !on_board_layer(ui, pointer) {
+            return;
         }
+        let (pressed, double, shift) = ui.input(|input| {
+            (
+                input.pointer.button_pressed(PointerButton::Primary),
+                input.pointer.button_double_clicked(PointerButton::Primary),
+                input.modifiers.shift,
+            )
+        });
+        if !pressed && !double {
+            return;
+        }
+        // A press inside the open editor belongs to the text field.
+        if let Some(editing) = &self.editing
+            && self
+                .hit_note(geometry, context, pointer, canvas_rect)
+                .as_ref()
+                == Some(editing)
+        {
+            return;
+        }
+        if double {
+            if let Some(id) = self.hit_note(geometry, context, pointer, canvas_rect) {
+                self.drag = None;
+                self.edit_note(context.board, id);
+            }
+            return;
+        }
+
+        self.finish_edit(context.board, true, output);
+        surrender_focus(ui.ctx());
+
+        if let Some(id) = self.link_handle_at(geometry, context, pointer, canvas_rect) {
+            self.link = Some(LinkDrag { from: id });
+            return;
+        }
+
+        if let Some(id) = self.hit_note(geometry, context, pointer, canvas_rect) {
+            if shift {
+                self.toggle_note(id);
+                return;
+            }
+            let reselect = self.single_selected() == Some(&id);
+            if !self.is_selected(&id) {
+                self.select_only(id.clone());
+            }
+            let world = self.camera.screen_to_world(pointer, canvas_rect);
+            let note_rect = geometry
+                .world_rect(&id)
+                .unwrap_or_else(|| Rect::from_min_size(world, Vec2::ZERO));
+            self.drag = Some(NoteDrag {
+                id,
+                grab: world - note_rect.min,
+                moved: false,
+                reselect,
+            });
+            return;
+        }
+
+        if let Some(edge) = hit_edge(context.board, geometry, &self.camera, canvas_rect, pointer) {
+            if shift {
+                self.toggle_edge(edge);
+            } else {
+                self.selected.clear();
+                self.selected_edges = vec![edge];
+            }
+            return;
+        }
+
+        if !shift {
+            self.clear_selection();
+        }
+        self.marquee = Some(Marquee {
+            origin: pointer,
+            additive: shift,
+            base: self.selected.clone(),
+        });
+    }
+
+    /// Visible notes whose screen rect lies fully inside the box.
+    fn notes_in_rect(
+        &self,
+        geometry: &Geometry,
+        context: &BoardContext<'_>,
+        rect: Rect,
+        canvas_rect: Rect,
+    ) -> Vec<NoteId> {
+        if rect.width() < DRAG_THRESHOLD && rect.height() < DRAG_THRESHOLD {
+            return Vec::new();
+        }
+        context
+            .board
+            .notes
+            .iter()
+            .filter(|note| note.status != Status::Done)
+            .filter(|note| {
+                geometry
+                    .screen_rect(&note.id, &self.camera, canvas_rect)
+                    .is_some_and(|screen| rect.contains_rect(screen))
+            })
+            .map(|note| note.id.clone())
+            .collect()
+    }
+
+    /// The note whose link handle is under the pointer (single selection only).
+    fn link_handle_at(
+        &self,
+        geometry: &Geometry,
+        context: &BoardContext<'_>,
+        pointer: Pos2,
+        canvas_rect: Rect,
+    ) -> Option<NoteId> {
+        let id = self.single_selected()?;
+        if self.editing.as_ref() == Some(id) {
+            return None;
+        }
+        context.board.note(id)?;
+        let screen = geometry.screen_rect(id, &self.camera, canvas_rect)?;
+        let center = link_handle_center(screen);
+        ((pointer - center).length() <= LINK_HANDLE_RADIUS * 1.5).then(|| id.clone())
     }
 
     fn has_editor_focus(&self, ui: &Ui) -> bool {
@@ -471,29 +663,97 @@ impl BoardView {
         self.link = None;
     }
 
-    fn handle_edge_input(
-        &mut self,
-        ui: &mut Ui,
-        context: &BoardContext<'_>,
-        output: &mut BoardOutput,
-    ) {
-        if !ui.input(|input| input.key_pressed(egui::Key::Delete)) {
+    /// Board keys. They act only when no text field has keyboard focus, except
+    /// Escape, which also closes the inline editor.
+    fn handle_keys(&mut self, ui: &mut Ui, context: &BoardContext<'_>, output: &mut BoardOutput) {
+        let ctx = ui.ctx().clone();
+        let focused = ctx.memory(|memory| memory.focused());
+        let editor_focused = self.editing.is_some()
+            && focused.is_some_and(|focused| Some(focused) == self.editor_id(ui));
+
+        if self.editing.is_some()
+            && (editor_focused || focused.is_none())
+            && ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape))
+        {
+            self.finish_edit(context.board, true, output);
+            surrender_focus(&ctx);
             return;
         }
-        if let Some(command) = self.delete_selected_edge(context.board) {
-            output.commands.push(command);
-            ui.ctx().request_repaint();
+        if focused.is_some() || self.editing.is_some() {
+            return;
+        }
+
+        let (escape, delete, enter, select_all) = ctx.input_mut(|input| {
+            let escape = !self.selected.is_empty() || !self.selected_edges.is_empty();
+            let escape = escape && input.consume_key(Modifiers::NONE, Key::Escape);
+            let delete = input.consume_key(Modifiers::NONE, Key::Delete)
+                | input.consume_key(Modifiers::NONE, Key::Backspace);
+            let enter = input.consume_key(Modifiers::NONE, Key::Enter);
+            let select_all = input.consume_key(Modifiers::COMMAND, Key::A);
+            (escape, delete, enter, select_all)
+        });
+
+        if escape {
+            self.clear_selection();
+        }
+        if delete {
+            let (commands, notes) = self.delete_selection(context.board);
+            output.deleted_notes += notes;
+            output.commands.extend(commands);
+            ctx.request_repaint();
+        }
+        if enter && let Some(id) = self.single_selected().cloned() {
+            self.edit_note(context.board, id);
+        }
+        if select_all {
+            self.selected = context
+                .board
+                .notes
+                .iter()
+                .filter(|note| note.status != Status::Done)
+                .map(|note| note.id.clone())
+                .collect();
+            self.selected_edges.clear();
         }
     }
 
-    /// Delete the selected arrow (task seam used by the key handler and tests).
-    fn delete_selected_edge(&mut self, board: &Board) -> Option<Command> {
-        let edge_id = self.selected_edge.clone()?;
-        board.edge(&edge_id)?;
-        self.selected_edge = None;
-        Some(Command::Unlink { edge_id })
+    fn editor_id(&self, ui: &Ui) -> Option<egui::Id> {
+        self.editing
+            .as_ref()
+            .map(|id| ui.scope_id().with(("board_editor", id.clone())))
     }
 
+    /// Commands that delete the selection: arrows first, then each selected
+    /// note whose ancestors are not also selected (the subtree goes with it).
+    /// Returns the commands and the number of notes asked for.
+    fn delete_selection(&mut self, board: &Board) -> (Vec<Command>, usize) {
+        let mut commands: Vec<Command> = self
+            .selected_edges
+            .iter()
+            .filter(|id| board.edge(id).is_some())
+            .map(|id| Command::Unlink {
+                edge_id: id.clone(),
+            })
+            .collect();
+        let roots: Vec<NoteId> = self
+            .selected
+            .iter()
+            .filter(|id| board.note(id).is_some())
+            .filter(|id| {
+                !self
+                    .selected
+                    .iter()
+                    .any(|other| other != *id && is_ancestor_or_self(board, other, id))
+            })
+            .cloned()
+            .collect();
+        let notes = roots.len();
+        commands.extend(roots.into_iter().map(|id| Command::Delete { id }));
+        self.clear_selection();
+        (commands, notes)
+    }
+
+    /// The innermost visible note under the pointer.
     fn hit_note(
         &self,
         geometry: &Geometry,
@@ -501,66 +761,21 @@ impl BoardView {
         pointer: Pos2,
         canvas_rect: Rect,
     ) -> Option<NoteId> {
-        for note in context.board.notes.iter().rev() {
+        let mut best: Option<(f32, NoteId)> = None;
+        for note in &context.board.notes {
             if note.status == Status::Done {
                 continue;
             }
             if let Some(rect) = geometry.screen_rect(&note.id, &self.camera, canvas_rect)
                 && rect.contains(pointer)
             {
-                return Some(note.id.clone());
+                let area = rect.width() * rect.height();
+                if best.as_ref().is_none_or(|(best, _)| area < *best) {
+                    best = Some((area, note.id.clone()));
+                }
             }
         }
-        None
-    }
-
-    fn hit_header(
-        &self,
-        geometry: &Geometry,
-        context: &BoardContext<'_>,
-        pointer: Pos2,
-        canvas_rect: Rect,
-    ) -> Option<NoteId> {
-        for note in context.board.notes.iter().rev() {
-            if note.status == Status::Done {
-                continue;
-            }
-            let Some(rect) = geometry.screen_rect(&note.id, &self.camera, canvas_rect) else {
-                continue;
-            };
-            if !rect.contains(pointer) {
-                continue;
-            }
-            let header_height =
-                (CONTAINER_HEADER * self.camera.zoom).clamp(10.0, (rect.height() * 0.5).max(10.0));
-            let header = Rect::from_min_size(rect.min, vec2(rect.width(), header_height));
-            if header.contains(pointer) {
-                return Some(note.id.clone());
-            }
-            return None;
-        }
-        None
-    }
-
-    fn hit_body(
-        &self,
-        geometry: &Geometry,
-        context: &BoardContext<'_>,
-        pointer: Pos2,
-        canvas_rect: Rect,
-    ) -> Option<NoteId> {
-        for note in context.board.notes.iter().rev() {
-            if note.status == Status::Done {
-                continue;
-            }
-            if let Some(rect) = geometry.screen_rect(&note.id, &self.camera, canvas_rect)
-                && rect.contains(pointer)
-                && !geometry.is_container(&note.id)
-            {
-                return Some(note.id.clone());
-            }
-        }
-        None
+        best.map(|(_, id)| id)
     }
 
     /// Commit a note drag at the given world position. Used by the release
@@ -616,7 +831,7 @@ impl BoardView {
             }
             let opacity = opacity_for(note, context.now_utc_ms);
             let palette = theme::note_palette(note.color.clamp(0, 255) as u8);
-            let selected = self.selected.as_deref() == Some(note.id.as_str());
+            let selected = self.is_selected(&note.id);
             let container = geometry.is_container(&note.id);
             let header_height = (CONTAINER_HEADER * self.camera.zoom)
                 .clamp(10.0, (screen.height() * 0.5).max(10.0));
@@ -656,13 +871,36 @@ impl BoardView {
                 }
             }
 
-            if self.editing.as_deref() == Some(note.id.as_str()) && !container {
+            // The card's context menu registers before the editor so the text
+            // field stays on top for clicks and selection.
+            let card_id = ui.scope_id().with(("note_card", note.id.clone()));
+            let response = ui.interact(screen, card_id, Sense::click());
+            if response.secondary_clicked() && !self.is_selected(&note.id) {
+                self.select_only(note.id.clone());
+            }
+            let targets: Vec<NoteId> = if self.is_selected(&note.id) {
+                self.selected.clone()
+            } else {
+                vec![note.id.clone()]
+            };
+            response.context_menu(|ui| {
+                self.context_menu(ui, context, note, &targets, output);
+            });
+
+            if self.editing.as_deref() == Some(note.id.as_str()) {
+                let bottom = if container {
+                    header.bottom() - padding * 0.5
+                } else {
+                    (screen.bottom() - padding).max(header.bottom() + padding + 4.0)
+                };
+                let top = if container {
+                    header.top() + padding * 0.5
+                } else {
+                    header.bottom() + padding
+                };
                 let editor_rect = Rect::from_min_max(
-                    pos2(screen.left() + padding, header.bottom() + padding),
-                    pos2(
-                        screen.right() - padding,
-                        (screen.bottom() - padding).max(header.bottom() + padding + 4.0),
-                    ),
+                    pos2(screen.left() + padding, top),
+                    pos2(screen.right() - padding, bottom),
                 );
                 if editor_rect.width() > 8.0 && editor_rect.height() > 8.0 {
                     let editor_id = ui.scope_id().with(("board_editor", note.id.clone()));
@@ -672,7 +910,11 @@ impl BoardView {
                         egui::TextEdit::multiline(&mut self.edit_buffer)
                             .id(editor_id)
                             .frame(egui::Frame::NONE)
-                            .background_color(Color32::TRANSPARENT)
+                            .background_color(if container {
+                                palette.header
+                            } else {
+                                Color32::TRANSPARENT
+                            })
                             .text_color(palette.ink)
                             .font(FontId::proportional(font_size))
                             .desired_width(editor_rect.width()),
@@ -685,95 +927,112 @@ impl BoardView {
                         ui.ctx().request_repaint();
                     }
                 }
-            } else if selected {
-                let center = pos2(screen.right() - 16.0, screen.center().y);
+            } else if self.single_selected().map(String::as_str) == Some(note.id.as_str()) {
+                let center = link_handle_center(screen);
                 painter.circle_filled(center, LINK_HANDLE_RADIUS, dim(theme::ACCENT, opacity));
-                let handle_id = ui.scope_id().with(("link_handle", note.id.clone()));
-                let response = ui.interact(
-                    Rect::from_center_size(center, Vec2::splat(LINK_HANDLE_RADIUS * 2.5)),
-                    handle_id,
-                    Sense::drag(),
-                );
-                if response.drag_started() {
-                    self.link = Some(LinkDrag {
-                        from: note.id.clone(),
-                    });
+                let hovered = ui
+                    .input(|input| input.pointer.hover_pos())
+                    .is_some_and(|pointer| (pointer - center).length() <= LINK_HANDLE_RADIUS * 1.5);
+                if hovered {
+                    ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
                 }
             }
-
-            let header_id = ui.scope_id().with(("note_header", note.id.clone()));
-            let response = ui.interact(header, header_id, Sense::click_and_drag());
-            if response.hovered() {
-                ui.ctx().set_cursor_icon(CursorIcon::Grab);
-            }
-            if response.clicked() {
-                self.selected = Some(note.id.clone());
-                self.selected_edge = None;
-            }
-            if response.double_clicked() {
-                self.edit_note(context.board, note.id.clone());
-            }
-            if response.drag_started()
-                && let Some(pointer) = ui.input(|input| input.pointer.interact_pos())
-            {
-                let world = self.camera.screen_to_world(pointer, canvas_rect);
-                let note_rect = geometry
-                    .world_rect(&note.id)
-                    .unwrap_or_else(|| Rect::from_min_size(world, Vec2::ZERO));
-                self.drag = Some(NoteDrag {
-                    id: note.id.clone(),
-                    grab: world - note_rect.min,
-                    moved: false,
-                });
-                self.selected = Some(note.id.clone());
-                self.selected_edge = None;
-            }
-            if response.drag_stopped()
-                && let Some(pointer) = ui.input(|input| input.pointer.interact_pos())
-            {
-                let world = self.camera.screen_to_world(pointer, canvas_rect);
-                if self.drag.as_ref().is_some_and(|drag| drag.moved) {
-                    output
-                        .commands
-                        .extend(self.commit_note_drop(context.board, geometry, world));
-                }
-                self.drag = None;
-                self.drop_target = None;
-            }
-
-            response.context_menu(|ui| {
-                if ui.button("Mark done").clicked() {
-                    output.commands.push(Command::Complete {
-                        id: note.id.clone(),
-                    });
-                    ui.close();
-                }
-                if ui.button("Snooze 1 hour").clicked() {
-                    if let Some(until) = snooze_after(context.now_utc_ms, 60, context.tz) {
-                        output.commands.push(Command::Snooze {
-                            id: note.id.clone(),
-                            until,
-                        });
-                    }
-                    ui.close();
-                }
-                if ui.button("Snooze until tomorrow 09:00").clicked() {
-                    if let Some(until) = snooze_tomorrow(context.now_utc_ms, context.tz) {
-                        output.commands.push(Command::Snooze {
-                            id: note.id.clone(),
-                            until,
-                        });
-                    }
-                    ui.close();
-                }
-                if note.snooze.is_some() && ui.button("Unsnooze").clicked() {
-                    output.commands.push(Command::Unsnooze {
-                        id: note.id.clone(),
-                    });
-                    ui.close();
-                }
-            });
         }
+    }
+
+    fn context_menu(
+        &mut self,
+        ui: &mut Ui,
+        context: &BoardContext<'_>,
+        note: &Note,
+        targets: &[NoteId],
+        output: &mut BoardOutput,
+    ) {
+        let many = targets.len() > 1;
+        if !many && ui.button("Edit").clicked() {
+            self.edit_note(context.board, note.id.clone());
+            ui.close();
+        }
+        if ui
+            .button(if many { "Mark all done" } else { "Mark done" })
+            .clicked()
+        {
+            output.commands.extend(
+                targets
+                    .iter()
+                    .map(|id| Command::Complete { id: id.clone() }),
+            );
+            ui.close();
+        }
+        if ui.button("Snooze 1 hour").clicked() {
+            if let Some(until) = snooze_after(context.now_utc_ms, 60, context.tz) {
+                output
+                    .commands
+                    .extend(targets.iter().map(|id| Command::Snooze {
+                        id: id.clone(),
+                        until: until.clone(),
+                    }));
+            }
+            ui.close();
+        }
+        if ui.button("Snooze until tomorrow 09:00").clicked() {
+            if let Some(until) = snooze_tomorrow(context.now_utc_ms, context.tz) {
+                output
+                    .commands
+                    .extend(targets.iter().map(|id| Command::Snooze {
+                        id: id.clone(),
+                        until: until.clone(),
+                    }));
+            }
+            ui.close();
+        }
+        let snoozed: Vec<NoteId> = targets
+            .iter()
+            .filter(|id| {
+                context
+                    .board
+                    .note(id)
+                    .is_some_and(|note| note.snooze.is_some())
+            })
+            .cloned()
+            .collect();
+        if !snoozed.is_empty() && ui.button("Unsnooze").clicked() {
+            output
+                .commands
+                .extend(snoozed.into_iter().map(|id| Command::Unsnooze { id }));
+            ui.close();
+        }
+        ui.separator();
+        let label = if many {
+            format!("Delete {} notes", targets.len())
+        } else {
+            "Delete".to_owned()
+        };
+        if ui
+            .button(RichText::new(label).color(theme::SAVE_ERROR))
+            .on_hover_text("Delete or Backspace")
+            .clicked()
+        {
+            self.selected = targets.to_vec();
+            self.selected_edges.clear();
+            let (commands, notes) = self.delete_selection(context.board);
+            output.deleted_notes += notes;
+            output.commands.extend(commands);
+            ui.close();
+        }
+    }
+
+    fn paint_marquee(&self, ui: &mut Ui, canvas_rect: Rect) {
+        let Some(marquee) = &self.marquee else {
+            return;
+        };
+        let Some(pointer) = ui.input(|input| input.pointer.interact_pos()) else {
+            return;
+        };
+        let rect = Rect::from_two_pos(marquee.origin, pointer);
+        let painter = ui.painter_at(canvas_rect);
+        painter.rect_filled(rect, 2, theme::ACCENT.gamma_multiply(0.12));
+        painter.rect_stroke(rect, 2, Stroke::new(1.0, theme::ACCENT), StrokeKind::Inside);
     }
 
     fn paint_drop_hint(&self, ui: &mut Ui, geometry: &Geometry, canvas_rect: Rect) {
@@ -1042,7 +1301,7 @@ fn paint_edges(
     geometry: &Geometry,
     camera: &Camera,
     canvas_rect: Rect,
-    selected: Option<&str>,
+    selected: &[EdgeId],
 ) {
     for edge in &board.edges {
         let Some(from) = geometry.num(&edge.from) else {
@@ -1055,7 +1314,7 @@ fn paint_edges(
             continue;
         };
         let points = edge_screen_points(&bezier, camera, canvas_rect);
-        let is_selected = selected == Some(edge.id.as_str());
+        let is_selected = selected.contains(&edge.id);
         let color = if is_selected {
             theme::ACCENT
         } else {
@@ -1229,6 +1488,11 @@ fn paint_snooze_mark(painter: &egui::Painter, card: Rect, zoom: f32, opacity: f3
     );
 }
 
+/// Centre of the link handle drawn on a selected note's right edge.
+fn link_handle_center(screen: Rect) -> Pos2 {
+    pos2(screen.right() - 16.0, screen.center().y)
+}
+
 fn first_line(text: &str) -> &str {
     text.lines().next().unwrap_or("").trim()
 }
@@ -1279,6 +1543,14 @@ fn time_spec_at(utc_ms: i64, tz: &str) -> Option<TimeSpec> {
         local: format!("{local:.0}"),
         tz: tz.to_owned(),
     })
+}
+
+/// True when the pointer is over the board itself, not over a floating panel,
+/// popup or menu drawn above it.
+fn on_board_layer(ui: &Ui, pointer: Pos2) -> bool {
+    ui.ctx()
+        .layer_id_at(pointer)
+        .is_none_or(|layer| layer == ui.layer_id())
 }
 
 fn surrender_focus(ctx: &egui::Context) {
@@ -1378,6 +1650,7 @@ mod tests {
             id: root.clone(),
             grab: vec2(10.0, 5.0),
             moved: true,
+            reselect: false,
         });
         let commands = view.commit_note_drop(&board, &geometry, pos2(300.0, 200.0));
         assert!(matches!(
@@ -1400,6 +1673,7 @@ mod tests {
             id: child.clone(),
             grab: Vec2::ZERO,
             moved: true,
+            reselect: false,
         });
         let commands = view.commit_note_drop(&board, &geometry, rects[&root].center());
         assert!(matches!(
@@ -1421,6 +1695,7 @@ mod tests {
             id: child.clone(),
             grab: Vec2::ZERO,
             moved: true,
+            reselect: false,
         });
         let commands = view.commit_note_drop(&board, &geometry, rects[&child].center());
         // The parent container is also under the pointer, so the result may be
@@ -1446,6 +1721,7 @@ mod tests {
             id: child.clone(),
             grab: Vec2::ZERO,
             moved: true,
+            reselect: false,
         });
         let commands = view.commit_note_drop(&board, &geometry, rects[&grandchild].center());
         assert!(matches!(
@@ -1530,12 +1806,38 @@ mod tests {
         );
 
         let mut view = BoardView::new();
-        view.selected_edge = Some(edge.clone());
+        view.selected_edges = vec![edge.clone()];
+        let (commands, notes) = view.delete_selection(&board);
+        assert_eq!(notes, 0);
         assert!(matches!(
-            view.delete_selected_edge(&board),
-            Some(Command::Unlink { edge_id }) if edge_id == edge
+            commands.as_slice(),
+            [Command::Unlink { edge_id }] if *edge_id == edge
         ));
-        assert!(view.delete_selected_edge(&board).is_none());
+        assert!(view.delete_selection(&board).0.is_empty());
+    }
+
+    #[test]
+    fn deleting_a_container_and_its_child_emits_one_delete() {
+        let mut store = store("board-delete-subtree");
+        let (_, root) = board_and_root(&mut store);
+        let child = add_note(&mut store, "child", Some(&root));
+        let other = add_note(&mut store, "other", None);
+        let board = Board::load(store.connection()).expect("load");
+        let mut view = BoardView::new();
+        view.selected = vec![child.clone(), root.clone(), other.clone()];
+        let (commands, notes) = view.delete_selection(&board);
+        assert_eq!(notes, 2);
+        assert!(matches!(
+            commands.as_slice(),
+            [Command::Delete { id: first }, Command::Delete { id: second }]
+                if *first == root && *second == other
+        ));
+        assert!(view.selected.is_empty());
+        store
+            .apply(&commands, crate::command::Actor::Human, None)
+            .expect("the batch applies without touching the child twice");
+        let board = Board::load(store.connection()).expect("load");
+        assert!(board.notes.is_empty());
     }
 
     #[test]
