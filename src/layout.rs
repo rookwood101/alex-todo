@@ -15,11 +15,10 @@
 //!   `padding * 2 + sum(col_width + gap)` wide and
 //!   `header + sum(row_height + gap)` high (one max width per column and one
 //!   max height per row, so differently sized children never overlap).
-//! * Children are ordered open first, then done, then by `sort`, then `id`.
-//! * Root notes are grouped into columns: one column per group, ordered by the
-//!   `(GroupId, sort)` list supplied by the caller, followed by an Inbox column
-//!   for notes with no group. Groups that appear on notes but not in that list
-//!   are appended by id so no note is silently dropped.
+//! * Siblings are ordered open before done, important before not, then by
+//!   `sort`, then `id`.
+//! * Unpinned root notes form one left-to-right row, top-aligned at `y = 0`,
+//!   in sibling order (the Inbox has the lowest sort, so it comes first).
 //! * `done` notes are laid out after their open siblings; `hidden` notes (the
 //!   caller's "Hide done" filter) are omitted; `snoozed` notes are laid out
 //!   normally.
@@ -41,9 +40,6 @@ use std::collections::{HashMap, HashSet};
 /// The board model uses the same width; callers convert from SQLite's `i64`
 /// rowids when they build [`LayoutNote`]s.
 pub type NoteId = u64;
-
-/// Identifier for a group.
-pub type GroupId = u64;
 
 /// Width of a leaf note, in world units.
 pub const LEAF_WIDTH: f32 = 260.0;
@@ -153,8 +149,8 @@ impl Rect {
 
 /// One note as the layout algorithm sees it.
 ///
-/// This mirrors the `notes` columns `parent_id`, `group_id`, `done`, `snoozed`,
-/// `pinned`, `pos_x`, `pos_y` and `sort_order`. Positions are top-left corner
+/// This mirrors the `notes` columns `parent_id`, `status`, `important`,
+/// `layout_mode`, `pos_x`, `pos_y` and `sort_order`. Positions are top-left corner
 /// coordinates and are only read for pinned root notes.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LayoutNote {
@@ -162,12 +158,12 @@ pub struct LayoutNote {
     pub id: NoteId,
     /// Parent container, if the note is nested.
     pub parent: Option<NoteId>,
-    /// Group whose root column the note belongs to; `None` is the Inbox.
-    pub group: Option<GroupId>,
     /// Completed notes sort after their open siblings.
     pub done: bool,
     /// Hidden notes are omitted from the layout.
     pub hidden: bool,
+    /// Important notes sort before other open siblings.
+    pub important: bool,
     /// Snoozed notes are still laid out; snoozing only dims them in the UI.
     pub snoozed: bool,
     /// Pinned root notes keep their stored `x`/`y`.
@@ -186,9 +182,9 @@ impl LayoutNote {
         Self {
             id,
             parent: None,
-            group: None,
             done: false,
             hidden: false,
+            important: false,
             snoozed: false,
             pinned: false,
             x: 0.0,
@@ -215,9 +211,9 @@ pub struct Layout {
 }
 
 impl Layout {
-    /// Compute the layout for `notes` and the caller-supplied group order.
-    pub fn compute(notes: &[LayoutNote], groups: &[(GroupId, i64)]) -> Self {
-        compute(notes, groups)
+    /// Compute the layout for `notes`.
+    pub fn compute(notes: &[LayoutNote]) -> Self {
+        compute(notes)
     }
 
     /// The rectangle for `id`, if the note is visible.
@@ -236,25 +232,15 @@ impl Layout {
     }
 }
 
-/// Compute the layout for `notes` and the caller-supplied group order.
+/// Compute the layout for `notes`.
 ///
-/// `groups` is a `(group id, sort)` list; it decides the left-to-right order of
-/// the group columns. The Inbox column (`group: None`) always comes last.
-/// Pinned roots are placed before the flow and do not consume column space.
-pub fn compute(notes: &[LayoutNote], groups: &[(GroupId, i64)]) -> Layout {
+/// Pinned roots are placed first at their stored positions and do not take a
+/// slot in the root row.
+pub fn compute(notes: &[LayoutNote]) -> Layout {
     let mut planner = Planner::build(notes);
     let mut layout = Layout::default();
 
-    let mut group_order: Vec<(GroupId, i64)> = Vec::with_capacity(groups.len());
-    let mut known_groups = HashSet::new();
-    for &(id, sort) in groups {
-        if known_groups.insert(id) {
-            group_order.push((id, sort));
-        }
-    }
-    group_order.sort_by_key(|&(id, sort)| (sort, id));
-
-    let mut by_group: HashMap<Option<GroupId>, Vec<NoteId>> = HashMap::new();
+    let mut flow = Vec::new();
     let mut pinned = Vec::new();
     for &id in &planner.roots {
         let Some(note) = planner.note(id) else {
@@ -263,7 +249,7 @@ pub fn compute(notes: &[LayoutNote], groups: &[(GroupId, i64)]) -> Layout {
         if note.pinned {
             pinned.push(id);
         } else {
-            by_group.entry(note.group).or_default().push(id);
+            flow.push(id);
         }
     }
 
@@ -277,39 +263,12 @@ pub fn compute(notes: &[LayoutNote], groups: &[(GroupId, i64)]) -> Layout {
         planner.place(id, Rect::new(x, y, size.w, size.h), &mut layout);
     }
 
-    let mut columns: Vec<Column> = Vec::new();
-    for &(group, _) in &group_order {
-        if let Some(mut ids) = by_group.remove(&Some(group)) {
-            sort_notes(&planner, &mut ids);
-            columns.push((Some(group), ids));
-        }
-    }
-
-    let mut extra_groups: Vec<GroupId> = by_group.keys().filter_map(|group| *group).collect();
-    extra_groups.sort_unstable();
-    for group in extra_groups {
-        if let Some(mut ids) = by_group.remove(&Some(group)) {
-            sort_notes(&planner, &mut ids);
-            columns.push((Some(group), ids));
-        }
-    }
-
-    if let Some(mut ids) = by_group.remove(&None) {
-        sort_notes(&planner, &mut ids);
-        columns.push((None, ids));
-    }
-
-    let mut column_x = 0.0;
-    for (_, ids) in columns {
-        let mut column_width = 0.0_f32;
-        let mut y = 0.0;
-        for id in ids {
-            let size = planner.measure(id, 0, &mut visiting);
-            column_width = column_width.max(size.w);
-            planner.place(id, Rect::new(column_x, y, size.w, size.h), &mut layout);
-            y += size.h + CONTAINER_GAP;
-        }
-        column_x += column_width + CONTAINER_GAP;
+    sort_notes(&planner, &mut flow);
+    let mut x = 0.0;
+    for id in flow {
+        let size = planner.measure(id, 0, &mut visiting);
+        planner.place(id, Rect::new(x, 0.0, size.w, size.h), &mut layout);
+        x += size.w + CONTAINER_GAP;
     }
 
     layout
@@ -361,9 +320,6 @@ pub fn edge_geometry(
         control2: start.lerp(end, 2.0 / 3.0),
     })
 }
-
-/// A `(group, root ids)` column while the layout is being assembled.
-type Column = (Option<GroupId>, Vec<NoteId>);
 
 /// A measured node.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -484,8 +440,9 @@ impl<'a> Planner<'a> {
         for parent in parent_ids {
             if let Some(list) = children.get_mut(&parent) {
                 list.sort_by_key(|id| {
-                    index.get(id).map_or((false, 0, *id), |&position| {
-                        (notes[position].done, notes[position].sort, *id)
+                    index.get(id).map_or((false, false, 0, *id), |&position| {
+                        let note = &notes[position];
+                        (note.done, !note.important, note.sort, *id)
                     })
                 });
             }
@@ -507,9 +464,10 @@ impl<'a> Planner<'a> {
             .and_then(|&position| self.notes.get(position))
     }
 
-    fn sort_key(&self, id: NoteId) -> (bool, i64, NoteId) {
-        self.note(id)
-            .map_or((false, 0, id), |note| (note.done, note.sort, id))
+    fn sort_key(&self, id: NoteId) -> (bool, bool, i64, NoteId) {
+        self.note(id).map_or((false, false, 0, id), |note| {
+            (note.done, !note.important, note.sort, id)
+        })
     }
 
     /// Bottom-up sizing with a depth cap and a defensive cycle guard.
@@ -633,7 +591,7 @@ mod tests {
             note.sort = index as i64;
             notes.push(note);
         }
-        let layout = Layout::compute(&notes, &[]);
+        let layout = Layout::compute(&notes);
         (notes, layout)
     }
 
@@ -708,7 +666,7 @@ mod tests {
         for id in 3..=6 {
             notes.push(with_parent(id, 2));
         }
-        let layout = Layout::compute(&notes, &[]);
+        let layout = Layout::compute(&notes);
 
         assert!(layout.containers.contains(&1));
         assert!(layout.containers.contains(&2));
@@ -732,54 +690,16 @@ mod tests {
     }
 
     #[test]
-    fn groups_then_inbox_form_ordered_columns() {
-        let groups = [(30_u64, 2_i64), (10, 0), (20, 1)];
-        let mut notes = Vec::new();
-        for (index, (group, _)) in groups.iter().enumerate() {
-            let mut note = LayoutNote::new(index as NoteId + 1);
-            note.group = Some(*group);
-            notes.push(note);
-        }
-        notes.push(LayoutNote::new(4));
-        let mut second_in_g10 = LayoutNote::new(5);
-        second_in_g10.group = Some(10);
-        second_in_g10.sort = 1;
-        notes.push(second_in_g10);
-
-        let layout = Layout::compute(&notes, &groups);
-        let g10 = layout.rects[&2];
-        let g20 = layout.rects[&3];
-        let g30 = layout.rects[&1];
-        let inbox = layout.rects[&4];
-
-        assert_eq!(g10.x, 0.0);
-        assert!(g10.x < g20.x);
-        assert!(g20.x < g30.x);
-        assert!(g30.x < inbox.x);
-        assert_eq!(g10.y, 0.0);
-        assert_eq!(g20.y, 0.0);
-        assert_eq!(g30.y, 0.0);
-        assert_eq!(inbox.y, 0.0);
-
-        let stacked = layout.rects[&5];
-        assert_eq!(stacked.x, g10.x);
-        assert_eq!(stacked.y, LEAF_HEIGHT + CONTAINER_GAP);
-        assert!(!g10.overlaps(stacked));
-    }
-
-    #[test]
-    fn unlisted_groups_are_appended_before_inbox() {
-        let groups = [(1_u64, 0_i64)];
-        let mut listed = LayoutNote::new(1);
-        listed.group = Some(1);
-        let mut extra = LayoutNote::new(2);
-        extra.group = Some(9);
-        let inbox = LayoutNote::new(3);
-
-        let layout = Layout::compute(&[listed, extra, inbox], &groups);
-        assert_eq!(layout.rects[&1].x, 0.0);
-        assert!(layout.rects[&1].x < layout.rects[&2].x);
-        assert!(layout.rects[&2].x < layout.rects[&3].x);
+    fn roots_form_a_row_and_important_notes_sort_first() {
+        let mut first = LayoutNote::new(1);
+        first.sort = 0;
+        let mut second = LayoutNote::new(2);
+        second.sort = 1;
+        second.important = true;
+        let layout = Layout::compute(&[first, second]);
+        assert_eq!(layout.rects[&2].x, 0.0, "important sorts first");
+        assert_eq!(layout.rects[&1].x, LEAF_WIDTH + CONTAINER_GAP);
+        assert_eq!(layout.rects[&1].y, 0.0);
     }
 
     #[test]
@@ -794,11 +714,11 @@ mod tests {
         let mut last = LayoutNote::new(3);
         last.sort = 2;
 
-        let layout = Layout::compute(&[first, pinned, last], &[]);
+        let layout = Layout::compute(&[first, pinned, last]);
         let pinned_rect = layout.rects[&2];
         assert_eq!((pinned_rect.x, pinned_rect.y), (900.0, 400.0));
         assert_eq!(layout.rects[&1].y, 0.0);
-        assert_eq!(layout.rects[&3].y, LEAF_HEIGHT + CONTAINER_GAP);
+        assert_eq!(layout.rects[&3].x, LEAF_WIDTH + CONTAINER_GAP);
     }
 
     #[test]
@@ -808,14 +728,14 @@ mod tests {
         let child = with_parent(2, 1);
         let open = LayoutNote::new(3);
 
-        let layout = Layout::compute(&[done, child, open], &[]);
+        let layout = Layout::compute(&[done, child, open]);
         assert_eq!(layout.rects.len(), 3);
         assert!(
             layout.is_container(1),
             "a done container keeps its children"
         );
-        assert_eq!(layout.rects[&3].y, 0.0, "the open note sorts first");
-        assert_eq!(layout.rects[&1].y, LEAF_HEIGHT + CONTAINER_GAP);
+        assert_eq!(layout.rects[&3].x, 0.0, "the open note sorts first");
+        assert_eq!(layout.rects[&1].x, LEAF_WIDTH + CONTAINER_GAP);
     }
 
     #[test]
@@ -824,13 +744,13 @@ mod tests {
         done.hidden = true;
         let promoted = with_parent(2, 1);
 
-        let layout = Layout::compute(&[done, promoted, LayoutNote::new(3)], &[]);
+        let layout = Layout::compute(&[done, promoted, LayoutNote::new(3)]);
         assert!(!layout.rects.contains_key(&1));
         assert_eq!(layout.rects.len(), 2);
         assert!(layout.rects.contains_key(&2));
         assert!(layout.rects.contains_key(&3));
         assert_eq!(layout.rects[&2].x, 0.0);
-        assert_eq!(layout.rects[&3].y, LEAF_HEIGHT + CONTAINER_GAP);
+        assert_eq!(layout.rects[&3].x, LEAF_WIDTH + CONTAINER_GAP);
     }
 
     #[test]
@@ -838,11 +758,11 @@ mod tests {
         let mut snoozed = LayoutNote::new(1);
         snoozed.snoozed = true;
 
-        let layout = Layout::compute(&[snoozed, LayoutNote::new(2)], &[]);
+        let layout = Layout::compute(&[snoozed, LayoutNote::new(2)]);
         assert!(layout.rects.contains_key(&1));
         assert!(layout.rects.contains_key(&2));
-        assert_eq!(layout.rects[&1].y, 0.0);
-        assert_eq!(layout.rects[&2].y, LEAF_HEIGHT + CONTAINER_GAP);
+        assert_eq!(layout.rects[&1].x, 0.0);
+        assert_eq!(layout.rects[&2].x, LEAF_WIDTH + CONTAINER_GAP);
     }
 
     #[test]
@@ -854,7 +774,7 @@ mod tests {
         let mut self_parent = LayoutNote::new(3);
         self_parent.parent = Some(3);
 
-        let layout = Layout::compute(&[first, second, self_parent, LayoutNote::new(4)], &[]);
+        let layout = Layout::compute(&[first, second, self_parent, LayoutNote::new(4)]);
         assert_eq!(layout.rects.len(), 1);
         assert!(layout.rects.contains_key(&4));
         assert!(layout.containers.is_empty());
@@ -865,7 +785,7 @@ mod tests {
         let mut orphan = LayoutNote::new(5);
         orphan.parent = Some(99);
 
-        let layout = Layout::compute(&[orphan], &[]);
+        let layout = Layout::compute(&[orphan]);
         assert_eq!(
             layout.rects[&5],
             Rect::new(0.0, 0.0, LEAF_WIDTH, LEAF_HEIGHT)
@@ -884,7 +804,7 @@ mod tests {
             notes.push(note);
         }
 
-        let layout = Layout::compute(&notes, &[]);
+        let layout = Layout::compute(&notes);
         assert_eq!(layout.rects.len(), DEPTH_CAP + 1);
         assert_eq!(layout.containers.len(), DEPTH_CAP);
         assert!(layout.rects.values().all(|rect| rect.is_finite()));
@@ -896,7 +816,7 @@ mod tests {
         for id in 2..=4 {
             notes.push(with_parent(id, 1));
         }
-        let layout = Layout::compute(&notes, &[]);
+        let layout = Layout::compute(&notes);
 
         for (from, to) in [(1_u64, 2_u64), (2, 3), (3, 4), (4, 1)] {
             let geometry = edge_geometry(from, to, &layout.rects).expect("edge anchors");
@@ -943,7 +863,7 @@ mod tests {
     #[test]
     fn layout_is_stable_across_repeated_calls() {
         let (notes, first) = leaf_grid(9);
-        let second = Layout::compute(&notes, &[]);
+        let second = Layout::compute(&notes);
         assert_eq!(first.rects, second.rects);
         assert_eq!(first.containers, second.containers);
     }

@@ -21,8 +21,8 @@ pub type EdgeId = String;
 /// Batch identifier.
 pub type BatchId = String;
 
-/// A note is open or done. Done notes are omitted from the canvas and never
-/// fire reminders.
+/// A note is open or done. Done notes stay on the canvas (struck through) and
+/// never fire reminders.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Status {
@@ -43,46 +43,6 @@ impl Status {
             "open" => Some(Self::Open),
             "done" => Some(Self::Done),
             _ => None,
-        }
-    }
-}
-
-/// Priority stored as low / med / high, matching the schema CHECK.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub enum Priority {
-    #[serde(rename = "low")]
-    Low,
-    #[serde(rename = "med")]
-    Medium,
-    #[serde(rename = "high")]
-    High,
-}
-
-impl Priority {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Low => "low",
-            Self::Medium => "med",
-            Self::High => "high",
-        }
-    }
-
-    fn parse(value: &str) -> Option<Self> {
-        match value {
-            "low" => Some(Self::Low),
-            "med" | "medium" => Some(Self::Medium),
-            "high" => Some(Self::High),
-            _ => None,
-        }
-    }
-}
-
-impl From<crate::capture::Priority> for Priority {
-    fn from(value: crate::capture::Priority) -> Self {
-        match value {
-            crate::capture::Priority::Low => Self::Low,
-            crate::capture::Priority::Medium => Self::Medium,
-            crate::capture::Priority::High => Self::High,
         }
     }
 }
@@ -124,13 +84,17 @@ pub struct Point {
 pub struct Note {
     pub id: NoteId,
     pub text: String,
-    pub group: Option<GroupId>,
     pub parent: Option<NoteId>,
     pub layout: LayoutMode,
     pub pos: Option<Point>,
     pub sort: i64,
     pub color: i64,
-    pub priority: Option<Priority>,
+    /// The binary importance flag (shown as a red "!").
+    #[serde(default)]
+    pub important: bool,
+    /// The one Inbox container (cannot be deleted, completed or moved).
+    #[serde(default)]
+    pub inbox: bool,
     pub status: Status,
     pub source: String,
     pub due: Option<TimeSpec>,
@@ -150,7 +114,8 @@ impl Note {
     }
 }
 
-/// A root column on the board.
+/// A legacy group row. Migration 0003 turned groups into container notes; the
+/// type stays so history can still restore old group events.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Group {
     pub id: GroupId,
@@ -176,11 +141,10 @@ pub struct Edge {
     pub version: i64,
 }
 
-/// Every active note, group and edge: one consistent snapshot for rendering.
+/// Every active note and edge: one consistent snapshot for rendering.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Board {
     pub notes: Vec<Note>,
-    pub groups: Vec<Group>,
     pub edges: Vec<Edge>,
 }
 
@@ -189,7 +153,6 @@ impl Board {
     pub fn load(conn: &Connection) -> Result<Self, ModelError> {
         Ok(Self {
             notes: load_notes(conn)?,
-            groups: load_groups(conn)?,
             edges: load_edges(conn)?,
         })
     }
@@ -198,8 +161,16 @@ impl Board {
         self.notes.iter().find(|note| note.id == id)
     }
 
-    pub fn group(&self, id: &str) -> Option<&Group> {
-        self.groups.iter().find(|group| group.id == id)
+    /// The Inbox container, once the first capture has created it.
+    pub fn inbox(&self) -> Option<&Note> {
+        self.notes.iter().find(|note| note.inbox)
+    }
+
+    /// True when a note has at least one active child.
+    pub fn has_children(&self, id: &str) -> bool {
+        self.notes
+            .iter()
+            .any(|note| note.parent.as_deref() == Some(id))
     }
 
     pub fn edge(&self, id: &str) -> Option<&Edge> {
@@ -236,8 +207,8 @@ pub enum ModelError {
     },
 }
 
-const NOTE_COLUMNS: &str = "id, text, group_id, parent_id, layout_mode, pos_x, pos_y,
-     sort_order, color, priority, status, source,
+const NOTE_COLUMNS: &str = "id, text, role, parent_id, layout_mode, pos_x, pos_y,
+     sort_order, color, important, status, source,
      created_at_utc_ms, updated_at_utc_ms, deleted_at_utc_ms, version,
      due_local, due_tz, due_utc_ms,
      remind_local, remind_tz, remind_utc_ms, reminded_at_utc_ms,
@@ -272,20 +243,6 @@ pub fn load_note(conn: &Connection, id: &str) -> Result<Option<Note>, ModelError
         Some(row) => Ok(Some(row?.into_note()?)),
         None => Ok(None),
     }
-}
-
-/// Every active group, ordered by sort_order then id.
-pub fn load_groups(conn: &Connection) -> Result<Vec<Group>, ModelError> {
-    let sql = format!(
-        "SELECT {GROUP_COLUMNS} FROM groups WHERE deleted_at_utc_ms IS NULL ORDER BY sort_order, id"
-    );
-    let mut statement = conn.prepare(&sql)?;
-    let rows = statement.query_map([], RawGroup::read)?;
-    let mut groups = Vec::new();
-    for row in rows {
-        groups.push(row?.into_group()?);
-    }
-    Ok(groups)
 }
 
 /// One group by id, including soft-deleted rows.
@@ -323,14 +280,53 @@ pub fn load_edge(conn: &Connection, id: &str) -> Result<Option<Edge>, ModelError
     }
 }
 
-/// The id of the first active group whose name matches case-insensitively.
-pub fn find_group_by_name(conn: &Connection, name: &str) -> Result<Option<GroupId>, ModelError> {
+/// Normalise a container name for matching: case-insensitive, with "-" and
+/// "_" read as spaces and runs of whitespace collapsed.
+pub fn normalize_container_name(name: &str) -> String {
+    name.chars()
+        .map(|ch| if ch == '-' || ch == '_' { ' ' } else { ch })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// The first active note under `parent` (root when None) whose first line
+/// matches `name` after [normalize_container_name].
+pub fn find_child_by_name(
+    conn: &Connection,
+    parent: Option<&str>,
+    name: &str,
+) -> Result<Option<NoteId>, ModelError> {
+    let wanted = normalize_container_name(name);
+    if wanted.is_empty() {
+        return Ok(None);
+    }
     let mut statement = conn.prepare(
-        "SELECT id FROM groups
-          WHERE deleted_at_utc_ms IS NULL AND lower(name) = lower(?1)
-          ORDER BY id LIMIT 1",
+        "SELECT id, text FROM notes
+          WHERE deleted_at_utc_ms IS NULL AND parent_id IS ?1
+          ORDER BY role IS NULL, sort_order, id",
     )?;
-    let mut rows = statement.query_map([name], |row| row.get::<_, String>(0))?;
+    let rows = statement.query_map([parent], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (id, text) = row?;
+        let title = text.lines().next().unwrap_or("");
+        if normalize_container_name(title) == wanted {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
+}
+
+/// The live Inbox id, if one exists.
+pub fn find_inbox(conn: &Connection) -> Result<Option<NoteId>, ModelError> {
+    let mut statement = conn.prepare(
+        "SELECT id FROM notes WHERE role = 'inbox' AND deleted_at_utc_ms IS NULL LIMIT 1",
+    )?;
+    let mut rows = statement.query_map([], |row| row.get::<_, String>(0))?;
     match rows.next() {
         Some(id) => Ok(Some(id?)),
         None => Ok(None),
@@ -340,14 +336,14 @@ pub fn find_group_by_name(conn: &Connection, name: &str) -> Result<Option<GroupI
 struct RawNote {
     id: String,
     text: String,
-    group_id: Option<String>,
+    role: Option<String>,
     parent_id: Option<String>,
     layout_mode: String,
     pos_x: Option<f64>,
     pos_y: Option<f64>,
     sort_order: i64,
     color: i64,
-    priority: Option<String>,
+    important: i64,
     status: String,
     source: String,
     created_at_utc_ms: i64,
@@ -372,14 +368,14 @@ impl RawNote {
         Ok(Self {
             id: row.get(0)?,
             text: row.get(1)?,
-            group_id: row.get(2)?,
+            role: row.get(2)?,
             parent_id: row.get(3)?,
             layout_mode: row.get(4)?,
             pos_x: row.get(5)?,
             pos_y: row.get(6)?,
             sort_order: row.get(7)?,
             color: row.get(8)?,
-            priority: row.get(9)?,
+            important: row.get(9)?,
             status: row.get(10)?,
             source: row.get(11)?,
             created_at_utc_ms: row.get(12)?,
@@ -411,11 +407,15 @@ impl RawNote {
             .ok_or_else(|| bad(format!("unknown layout_mode {:?}", self.layout_mode)))?;
         let status = Status::parse(&self.status)
             .ok_or_else(|| bad(format!("unknown status {:?}", self.status)))?;
-        let priority = match self.priority.as_deref() {
-            Some(value) => Some(
-                Priority::parse(value).ok_or_else(|| bad(format!("unknown priority {value:?}")))?,
-            ),
-            None => None,
+        let inbox = match self.role.as_deref() {
+            None => false,
+            Some("inbox") => true,
+            Some(value) => return Err(bad(format!("unknown role {value:?}"))),
+        };
+        let important = match self.important {
+            0 => false,
+            1 => true,
+            value => return Err(bad(format!("important must be 0 or 1, not {value}"))),
         };
         let pos = match (layout, self.pos_x, self.pos_y) {
             (LayoutMode::Pinned, Some(x), Some(y)) => Some(Point {
@@ -452,13 +452,13 @@ impl RawNote {
         Ok(Note {
             id: self.id,
             text: self.text,
-            group: self.group_id,
             parent: self.parent_id,
             layout,
             pos,
             sort: self.sort_order,
             color: self.color,
-            priority,
+            important,
+            inbox,
             status,
             source: self.source,
             due,
@@ -622,7 +622,6 @@ mod tests {
     fn a_fresh_board_is_empty() {
         let (_store, board) = board("model-fresh");
         assert!(board.notes.is_empty());
-        assert!(board.groups.is_empty());
         assert!(board.edges.is_empty());
         assert_eq!(count_active_notes(_store.connection()).expect("count"), 0);
     }
@@ -644,14 +643,14 @@ mod tests {
         let raw = RawNote {
             id: "bad".to_owned(),
             text: "x".to_owned(),
-            group_id: None,
+            role: Some("outbox".to_owned()),
             parent_id: None,
             layout_mode: "flow".to_owned(),
             pos_x: None,
             pos_y: None,
             sort_order: 0,
             color: 0,
-            priority: Some("urgent".to_owned()),
+            important: 0,
             status: "open".to_owned(),
             source: "human".to_owned(),
             created_at_utc_ms: 1,
@@ -670,7 +669,7 @@ mod tests {
             snooze_utc_ms: None,
             completed_at_utc_ms: None,
         };
-        let error = raw.into_note().expect_err("unknown priority is malformed");
+        let error = raw.into_note().expect_err("unknown role is malformed");
         assert!(matches!(
             error,
             ModelError::Malformed { entity: "note", .. }

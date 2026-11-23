@@ -94,3 +94,6 @@ pub fn apply(ctx: &egui::Context) {
     visuals.widgets.active.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
     ctx.set_visuals(visuals);
 }
+
+/// The red "!" that marks an important note.
+pub const IMPORTANT: Color32 = Color32::from_rgb(0xef, 0x4b, 0x4b);

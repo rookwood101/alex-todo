@@ -1,6 +1,6 @@
 //! Board canvas for the SQLite model (task 100).
 //!
-//! The view turns [model::Board] into layout geometry, paints groups, nested
+//! The view turns [model::Board] into layout geometry, paints nested
 //! containers, notes and arrows, and turns pointer input into [Command] values.
 //! It owns no database handle: the app applies the returned commands through
 //! [crate::command::Store::apply] and reloads.
@@ -35,7 +35,7 @@ use eframe::egui::{
 use crate::camera::Camera;
 use crate::command::Command;
 use crate::layout::{self, EdgeGeometry, Layout, LayoutNote};
-use crate::model::{Board, EdgeId, GroupId, Note, NoteId, Priority, Status};
+use crate::model::{Board, EdgeId, Note, NoteId, Status};
 use crate::theme;
 use crate::time::TimeSpec;
 
@@ -630,6 +630,9 @@ impl BoardView {
         canvas_rect: Rect,
     ) -> Option<NoteId> {
         let id = self.hit_note(geometry, context, pointer, canvas_rect)?;
+        if context.board.note(&id).is_some_and(|note| note.inbox) {
+            return None;
+        }
         let screen = geometry.screen_rect(&id, &self.camera, canvas_rect)?;
         let header = header_rect(screen, self.camera.zoom);
         checkbox_rect(header, self.camera.zoom)
@@ -790,7 +793,7 @@ impl BoardView {
         let roots: Vec<NoteId> = self
             .selected
             .iter()
-            .filter(|id| board.note(id).is_some())
+            .filter(|id| board.note(id).is_some_and(|note| !note.inbox))
             .filter(|id| {
                 !self
                     .selected
@@ -852,6 +855,7 @@ impl BoardView {
         vec![Command::SetParent {
             id: drag.id,
             parent: target,
+            before: None,
         }]
     }
 
@@ -901,8 +905,26 @@ impl BoardView {
             };
             let padding = (theme::NOTE_PADDING * self.camera.zoom).max(2.0);
             let checkbox = checkbox_rect(header, self.camera.zoom);
-            paint_checkbox(painter, checkbox, done, palette.ink, opacity);
-            let title_left = checkbox.right() + padding * 0.75;
+            let mut title_left = if note.inbox {
+                screen.left() + padding
+            } else {
+                paint_checkbox(painter, checkbox, done, palette.ink, opacity);
+                checkbox.right() + padding * 0.75
+            };
+            if note.important {
+                let galley = painter.layout_no_wrap(
+                    "!".to_owned(),
+                    FontId::proportional(title_font * 1.15),
+                    dim(theme::IMPORTANT, opacity),
+                );
+                let size = galley.size();
+                painter.galley(
+                    pos2(title_left, header.center().y - size.y * 0.5),
+                    galley,
+                    Color32::TRANSPARENT,
+                );
+                title_left += size.x + padding * 0.5;
+            }
             let progress = container
                 .then(|| child_progress(context.board, &note.id))
                 .flatten();
@@ -950,7 +972,6 @@ impl BoardView {
 
             if !container {
                 paint_due_chip(painter, screen, note, self.camera.zoom, opacity);
-                paint_priority_dot(painter, header, note.priority, self.camera.zoom, opacity);
                 if is_snoozed(note, context.now_utc_ms) {
                     paint_snooze_mark(painter, screen, self.camera.zoom, opacity);
                 }
@@ -1038,6 +1059,9 @@ impl BoardView {
             self.edit_note(context.board, note.id.clone());
             ui.close();
         }
+        let protected = targets
+            .iter()
+            .all(|id| context.board.note(id).is_some_and(|note| note.inbox));
         let all_done = targets.iter().all(|id| {
             context
                 .board
@@ -1049,7 +1073,7 @@ impl BoardView {
             (false, true) => "Mark all done",
             (false, false) => "Mark done",
         };
-        if ui.button(label).on_hover_text("Ctrl+Enter").clicked() {
+        if !protected && ui.button(label).on_hover_text("Ctrl+Enter").clicked() {
             output
                 .commands
                 .extend(toggle_done_commands(context.board, targets));
@@ -1092,6 +1116,9 @@ impl BoardView {
                 .commands
                 .extend(snoozed.into_iter().map(|id| Command::Unsnooze { id }));
             ui.close();
+        }
+        if protected {
+            return;
         }
         ui.separator();
         let label = if many {
@@ -1187,12 +1214,6 @@ impl Geometry {
         } else {
             std::collections::HashSet::new()
         };
-        let group_nums: HashMap<GroupId, u64> = board
-            .groups
-            .iter()
-            .enumerate()
-            .map(|(index, group)| (group.id.clone(), index as u64))
-            .collect();
         let num_by_note: HashMap<NoteId, u64> = board
             .notes
             .iter()
@@ -1213,10 +1234,7 @@ impl Geometry {
                     .parent
                     .as_ref()
                     .and_then(|parent| num_by_note.get(parent).copied()),
-                group: note
-                    .group
-                    .as_ref()
-                    .and_then(|group| group_nums.get(group).copied()),
+                important: note.important,
                 done: note.status == Status::Done,
                 hidden: hidden.contains(&note.id),
                 snoozed: is_snoozed(note, now_utc_ms),
@@ -1226,12 +1244,7 @@ impl Geometry {
                 sort: note.sort,
             })
             .collect();
-        let groups: Vec<(u64, i64)> = board
-            .groups
-            .iter()
-            .map(|group| (group_nums[&group.id], group.sort_order))
-            .collect();
-        let layout = layout::compute(&notes, &groups);
+        let layout = layout::compute(&notes);
 
         Self {
             layout,
@@ -1577,28 +1590,6 @@ fn paint_due_chip(painter: &egui::Painter, card: Rect, note: &Note, zoom: f32, o
     );
 }
 
-fn paint_priority_dot(
-    painter: &egui::Painter,
-    header: Rect,
-    priority: Option<Priority>,
-    zoom: f32,
-    opacity: f32,
-) {
-    let Some(priority) = priority else {
-        return;
-    };
-    let color = match priority {
-        Priority::High => Color32::from_rgb(0xef, 0x6b, 0x6b),
-        Priority::Medium => Color32::from_rgb(0xe0, 0xbf, 0x7a),
-        Priority::Low => Color32::from_rgb(0x86, 0xc9, 0x9a),
-    };
-    painter.circle_filled(
-        pos2(header.right() - 10.0 * zoom, header.center().y),
-        (3.5 * zoom).clamp(1.5, 5.0),
-        dim(color, opacity),
-    );
-}
-
 fn paint_snooze_mark(painter: &egui::Painter, card: Rect, zoom: f32, opacity: f32) {
     let font_size = (12.0 * zoom).clamp(4.0, 14.0);
     painter.text(
@@ -1664,7 +1655,11 @@ fn child_progress(board: &Board, id: &str) -> Option<(usize, usize)> {
 
 /// Complete every open target, or reopen them all when every target is done.
 fn toggle_done_commands(board: &Board, targets: &[NoteId]) -> Vec<Command> {
-    let notes: Vec<&Note> = targets.iter().filter_map(|id| board.note(id)).collect();
+    let notes: Vec<&Note> = targets
+        .iter()
+        .filter_map(|id| board.note(id))
+        .filter(|note| !note.inbox)
+        .collect();
     if notes.is_empty() {
         return Vec::new();
     }
@@ -1774,11 +1769,12 @@ mod tests {
             .apply(
                 &[Command::AddNote {
                     text: "parent".to_owned(),
-                    group: None,
                     parent: None,
+                    container: None,
+                    at_root: true,
                     due: None,
                     remind: None,
-                    priority: None,
+                    important: false,
                     source: "test".to_owned(),
                 }],
                 crate::command::Actor::Human,
@@ -1794,11 +1790,12 @@ mod tests {
             .apply(
                 &[Command::AddNote {
                     text: text.to_owned(),
-                    group: None,
                     parent: parent.map(str::to_owned),
+                    container: None,
+                    at_root: true,
                     due: None,
                     remind: None,
-                    priority: None,
+                    important: false,
                     source: "test".to_owned(),
                 }],
                 crate::command::Actor::Human,
@@ -1876,7 +1873,7 @@ mod tests {
         let commands = view.commit_note_drop(&board, &geometry, rects[&root].center());
         assert!(matches!(
             commands.as_slice(),
-            [Command::SetParent { id, parent: Some(target) }] if id == &child && target == &root
+            [Command::SetParent { id, parent: Some(target), .. }] if id == &child && target == &root
         ));
     }
 
@@ -1900,7 +1897,7 @@ mod tests {
         // the current parent, but never the note itself.
         assert!(matches!(
             commands.as_slice(),
-            [Command::SetParent { id, parent }]
+            [Command::SetParent { id, parent, .. }]
                 if id == &child && parent.as_deref() != Some(child.as_str())
         ));
     }
@@ -1924,7 +1921,7 @@ mod tests {
         let commands = view.commit_note_drop(&board, &geometry, rects[&grandchild].center());
         assert!(matches!(
             commands.as_slice(),
-            [Command::SetParent { id, parent }]
+            [Command::SetParent { id, parent, .. }]
                 if id == &child
                     && parent.as_deref() != Some(child.as_str())
                     && parent.as_deref() != Some(grandchild.as_str())

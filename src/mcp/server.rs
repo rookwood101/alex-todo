@@ -14,7 +14,9 @@ use serde_json::Value;
 
 use crate::store::StorePaths;
 
-use super::tools::{self, BoardApplyArgs, BoardHistoryArgs, BoardQueryArgs, BoardSqlArgs};
+use super::tools::{
+    self, BoardApplyArgs, BoardFindContainerArgs, BoardHistoryArgs, BoardQueryArgs, BoardSqlArgs,
+};
 
 /// One Rustboard MCP server bound to a board database.
 #[derive(Clone)]
@@ -50,7 +52,7 @@ fn to_json<T: Serialize>(value: T) -> Result<Json<Value>, String> {
 impl BoardServer {
     /// List the board tables and their columns.
     #[tool(
-        description = "List the Rustboard tables and their columns. The five audit tables (batches, undo_targets, events, snapshots, schema_migrations) are read-only; notes, groups and edges are read-write."
+        description = "List the Rustboard tables and their columns. The five audit tables (batches, undo_targets, events, snapshots, schema_migrations) are read-only; notes and edges are read-write. A container is any note with children (notes.parent_id); the one Inbox has notes.role = 'inbox'. notes.important is 0 or 1. The groups table, notes.group_id and notes.priority are legacy and unused."
     )]
     async fn board_schema(&self) -> Result<Json<Value>, String> {
         to_json(tools::board_schema(&self.paths).map_err(|error| error.to_string())?)
@@ -69,7 +71,7 @@ impl BoardServer {
 
     /// Apply typed commands as one agent batch.
     #[tool(
-        description = "Apply one or more typed board commands as a single agent batch (the same command layer the UI uses). Returns the batch id, per-command effects and any new note/group/edge ids. Use this for normal board edits; it validates every command and records history automatically."
+        description = "Apply one or more typed board commands as a single agent batch (the same command layer the UI uses). Returns the batch id, per-command effects and any new note/edge ids. add_note without parent, container or at_root lands in the Inbox; container takes a path like 'work/q4' and creates missing containers. Use this for normal board edits; it validates every command and records history automatically."
     )]
     async fn board_apply(
         &self,
@@ -80,13 +82,24 @@ impl BoardServer {
 
     /// Run one audited DML statement.
     #[tool(
-        description = "Run exactly one DML or SELECT statement under the board_sql authorizer. This is DML-only and audited: INSERT/UPDATE/DELETE are allowed on notes, groups and edges only, and the five audit tables plus the schema, pragmas, ATTACH, transactions, VACUUM and dangerous functions are rejected. A successful statement commits one apply batch, one whole-board event and a before-image snapshot; foreign-key, integrity, parent-cycle, edge-endpoint and time-zone checks must all pass or the whole statement rolls back."
+        description = "Run exactly one DML or SELECT statement under the board_sql authorizer. This is DML-only and audited: INSERT/UPDATE/DELETE are allowed on notes and edges only, and the five audit tables plus the schema, pragmas, ATTACH, transactions, VACUUM and dangerous functions are rejected. A successful statement commits one apply batch, one whole-board event and a before-image snapshot; foreign-key, integrity, parent-cycle, edge-endpoint and time-zone checks must all pass or the whole statement rolls back."
     )]
     async fn board_sql(
         &self,
         Parameters(args): Parameters<BoardSqlArgs>,
     ) -> Result<Json<Value>, String> {
         to_json(tools::board_sql(&self.paths, args).map_err(|error| error.to_string())?)
+    }
+
+    /// Find a container by name path.
+    #[tool(
+        description = "Find a container note by name path, such as \"Work\" or \"work/q4\". Matching is case-insensitive and reads \"-\"/\"_\" as spaces. Returns {id, inbox_id}; id is null when nothing matches. Read-only."
+    )]
+    async fn board_find_container(
+        &self,
+        Parameters(args): Parameters<BoardFindContainerArgs>,
+    ) -> Result<Json<Value>, String> {
+        to_json(tools::board_find_container(&self.paths, args).map_err(|error| error.to_string())?)
     }
 
     /// Read note events or a batch range.
@@ -120,7 +133,7 @@ mod tests {
     }
 
     #[test]
-    fn the_router_lists_the_five_contract_tools_with_schemas() {
+    fn the_router_lists_the_contract_tools_with_schemas() {
         let server = BoardServer::new(board("mcp-server-router"));
         let tools = server.tool_definitions();
         let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
@@ -128,6 +141,7 @@ mod tests {
             names,
             vec![
                 "board_apply",
+                "board_find_container",
                 "board_history",
                 "board_query",
                 "board_schema",
@@ -181,7 +195,12 @@ mod tests {
             .and_then(|items| items.get("oneOf"))
             .and_then(serde_json::Value::as_array)
             .expect("command variants");
-        assert_eq!(variants.len(), 19, "every Command variant is described");
+        assert_eq!(variants.len(), 16, "every Command variant is described");
+        let schema_text = serde_json::to_string(variants).expect("encode");
+        assert!(
+            !schema_text.contains("group") && !schema_text.contains("priority"),
+            "no legacy group or priority commands remain"
+        );
         assert!(properties.get("description").is_some());
         assert!(properties.get("actor_ref").is_some());
 

@@ -18,7 +18,6 @@ use jiff::tz::TimeZone;
 
 use crate::capture::{self, ParsedCapture};
 use crate::command::Command;
-use crate::model::Priority;
 use crate::theme;
 use crate::time::TimeSpec;
 
@@ -182,8 +181,8 @@ impl ComposerState {
 pub enum ComposerChipKind {
     /// A hash group token, known or proposed.
     Group,
-    /// A bang priority token.
-    Priority,
+    /// The "!" importance token.
+    Important,
     /// A parsed deadline.
     Due,
 }
@@ -423,18 +422,18 @@ fn submit_line(
                 context.tz,
                 context.known_groups,
             );
-            let has_chips =
-                parsed.group.is_some() || parsed.priority.is_some() || parsed.due.is_some();
+            let has_chips = parsed.group.is_some() || parsed.important || parsed.due.is_some();
             if parsed.text.trim().is_empty() && !has_chips {
                 return;
             }
             output.capture = Some(Command::AddNote {
                 text: parsed.text,
-                group: parsed.group.map(|group| group.name),
                 parent: None,
+                container: parsed.group.map(|group| group.name),
+                at_root: false,
                 due: parsed.due,
                 remind: None,
-                priority: parsed.priority.map(Priority::from),
+                important: parsed.important,
                 source: "capture".to_owned(),
             });
             state.text.clear();
@@ -460,10 +459,10 @@ fn chips_for(parsed: &ParsedCapture, context: &ComposerContext<'_>) -> Vec<Compo
             proposed: !group.known,
         });
     }
-    if let Some(priority) = parsed.priority {
+    if parsed.important {
         chips.push(ComposerChip {
-            kind: ComposerChipKind::Priority,
-            label: format!("!{}", priority.label()),
+            kind: ComposerChipKind::Important,
+            label: "! important".to_owned(),
             proposed: false,
         });
     }
@@ -527,7 +526,7 @@ fn chip_badge(ui: &mut egui::Ui, chip: &ComposerChip) {
     let (fill, color) = match chip.kind {
         ComposerChipKind::Group if chip.proposed => (theme::BUTTON_BG, theme::SAVE_WARN),
         ComposerChipKind::Group => (theme::ACCENT_SOFT, theme::TEXT_PRIMARY),
-        ComposerChipKind::Priority => (theme::BUTTON_BG, theme::SAVE_ERROR),
+        ComposerChipKind::Important => (theme::BUTTON_BG, theme::SAVE_ERROR),
         ComposerChipKind::Due => (theme::BUTTON_BG, theme::SAVE_WARN),
     };
     let label = if chip.proposed {
@@ -653,18 +652,17 @@ mod tests {
         }
     }
 
-    fn add_note(
-        mut output: ComposerOutput,
-    ) -> (String, Option<String>, Option<Priority>, Option<TimeSpec>) {
+    fn add_note(mut output: ComposerOutput) -> (String, Option<String>, bool, Option<TimeSpec>) {
         let capture = output.capture.take();
         let Some(Command::AddNote {
             text,
-            group,
-            priority,
+            container: group,
+            important: priority,
             due,
             source,
             parent,
             remind,
+            at_root,
         }) = capture
         else {
             panic!("expected one AddNote, got {:?}", output);
@@ -672,6 +670,7 @@ mod tests {
         assert_eq!(source, "capture");
         assert_eq!(parent, None);
         assert_eq!(remind, None);
+        assert!(!at_root);
         (text, group, priority, due)
     }
 
@@ -713,7 +712,7 @@ mod tests {
 
         assert_eq!(text, "buy milk");
         assert_eq!(group.as_deref(), Some("home"));
-        assert_eq!(priority, Some(Priority::High));
+        assert!(priority);
         let due = due.expect("tomorrow should parse into a due time");
         assert_eq!(due.local, "2026-11-23T09:00:00");
         assert_eq!(harness.state.text(), "", "Enter must clear the input");
@@ -819,7 +818,7 @@ mod tests {
     }
 
     #[test]
-    fn chips_reflect_group_priority_and_tomorrow() {
+    fn chips_reflect_group_importance_and_tomorrow() {
         let harness = Harness::with_groups(&["Home"]);
         let context = ComposerContext {
             now_utc_ms: harness.now_utc_ms,
@@ -835,8 +834,7 @@ mod tests {
         assert_eq!(chips[0].label, "#Home", "known names are canonicalised");
         assert!(!chips[0].proposed);
 
-        assert_eq!(chips[1].kind, ComposerChipKind::Priority);
-        assert_eq!(chips[1].label, "!high");
+        assert_eq!(chips[1].kind, ComposerChipKind::Important);
 
         assert_eq!(chips[2].kind, ComposerChipKind::Due);
         assert!(
@@ -910,13 +908,13 @@ mod tests {
     fn capture_preview_does_not_need_a_focused_editor() {
         let harness = Harness::new();
         let context = ComposerContext::new(harness.now_utc_ms, TZ, &[]);
-        let (parsed, chips) = capture_preview(&context, "#home !low");
+        let (parsed, chips) = capture_preview(&context, "#home !");
         assert_eq!(parsed.text, "");
         assert_eq!(chips.len(), 2);
-        let priority = chips
-            .iter()
-            .find(|chip| chip.kind == ComposerChipKind::Priority)
-            .expect("priority chip");
-        assert_eq!(priority.label, "!low");
+        assert!(
+            chips
+                .iter()
+                .any(|chip| chip.kind == ComposerChipKind::Important)
+        );
     }
 }

@@ -12,11 +12,13 @@ Built with Rust, [egui/eframe](https://github.com/emilk/egui) on WGPU, <code>rus
 
 ## What works
 
-- Infinite, zoomable canvas; groups are root columns, **Inbox** catches ungrouped notes.
+- Infinite, zoomable canvas. Any note with children is a container; root containers sit in a
+  row, and the **Inbox** container catches notes captured without a <code>#container</code>.
 - Nested notes tile inside containers; arrows link notes; root notes can be pinned by dragging.
+- Important notes show a red <code>!</code> and sort first in their container.
 - One composer with two modes: **Capture** (Enter creates a note instantly, no model call) and
   **Agent** (Enter sends a prompt to Pi). **Tab** switches modes.
-- Capture chips: <code>#group</code>, <code>!high</code>/<code>!med</code>/<code>!low</code>, and
+- Capture chips: <code>#container</code> (created if missing), <code>!</code> for important, and
   trailing deadlines such as <code>tomorrow 4pm</code>.
 - SQLite storage (WAL) with versioned migrations, pre-migration backups and FTS5 search.
 - Every mutation is one batch with before/after events; undo and redo are new batches, so history
@@ -82,8 +84,8 @@ all three binaries:
 | Ctrl+N | New note in the Inbox |
 | Ctrl+Z / Ctrl+Shift+Z | Undo / redo |
 
-Capture examples: <code>buy milk tomorrow 4pm #home !high</code>,
-<code>pay rent by friday</code>, <code>call #work !low</code>,
+Capture examples: <code>buy milk tomorrow 4pm #home !</code>,
+<code>pay rent by friday</code>, <code>call #work</code>,
 <code>ship 2026-12-01 09:30</code>. A date with no time means 09:00 local; a bare time already
 past rolls to tomorrow. Ambiguous text is left alone ("the 4pm thing" stays text).
 
@@ -107,8 +109,8 @@ and <code>--approve</code> is used.
 
 ## Storage
 
-- Database: <code>%LOCALAPPDATA%\Rustboard\board.sqlite3</code> (WAL). Tables: <code>notes</code>,
-  <code>groups</code>, <code>edges</code>, plus the append-only <code>batches</code>,
+- Database: <code>%LOCALAPPDATA%\Rustboard\board.sqlite3</code> (WAL). Tables: <code>notes</code>
+  and <code>edges</code> (the legacy <code>groups</code> table is unused since migration 0003), plus the append-only <code>batches</code>,
   <code>undo_targets</code>, <code>events</code>, <code>snapshots</code> and
   <code>schema_migrations</code>.
 - Soft deletes (<code>deleted_at_utc_ms</code>); every read filters them out.

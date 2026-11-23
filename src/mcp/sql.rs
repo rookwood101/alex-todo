@@ -303,11 +303,12 @@ mod tests {
             .apply(
                 &[Command::AddNote {
                     text: "kept".to_owned(),
-                    group: None,
+                    container: None,
+                    at_root: true,
                     parent: None,
                     due: None,
                     remind: None,
-                    priority: None,
+                    important: false,
                     source: "test".to_owned(),
                 }],
                 Actor::Human,
