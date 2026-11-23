@@ -17,8 +17,9 @@
 //! * root notes pin where they are dropped; child notes reparent when dropped
 //!   over a container, otherwise they move to the root; a drop on the note
 //!   itself or one of its descendants is rejected;
-//! * a single selected note shows a link handle; drag it onto another note to
-//!   link;
+//! * a hovered or single selected note shows a link handle on its right
+//!   border; drag it onto another note to link (a live arrow follows);
+//! * right-click an arrow to delete it;
 //! * each note has a checkbox; Ctrl+Enter toggles done on the selection; done
 //!   notes stay in place with struck-through, muted text and sort after their
 //!   open siblings; "Hide done" omits done notes that have no open descendants;
@@ -44,7 +45,7 @@ pub const SNOOZE_OPACITY: f32 = 0.35;
 /// A drop must move at least this many screen pixels to count as a drag.
 const DRAG_THRESHOLD: f32 = 3.0;
 /// Hit radius around an arrow, in screen pixels.
-const EDGE_HIT_RADIUS: f32 = 7.0;
+const EDGE_HIT_RADIUS: f32 = 10.0;
 /// Radius of the link handle drawn on the selected note.
 const LINK_HANDLE_RADIUS: f32 = 7.0;
 /// Height of a container header in world units (matches the layout engine).
@@ -96,6 +97,8 @@ pub struct BoardView {
     /// Selected arrows, in selection order.
     pub selected_edges: Vec<EdgeId>,
     marquee: Option<Marquee>,
+    /// The arrow whose right-click menu is open.
+    edge_menu: Option<EdgeId>,
     editing: Option<NoteId>,
     edit_buffer: String,
     focus_requested: Option<NoteId>,
@@ -165,6 +168,7 @@ impl BoardView {
             selected: Vec::new(),
             selected_edges: Vec::new(),
             marquee: None,
+            edge_menu: None,
             editing: None,
             edit_buffer: String::new(),
             focus_requested: None,
@@ -302,7 +306,7 @@ impl BoardView {
             return output;
         }
 
-        let (canvas_rect, _background) = ui.allocate_exact_size(available, Sense::click());
+        let (canvas_rect, background) = ui.allocate_exact_size(available, Sense::click());
         if canvas_rect.width() < 1.0 || canvas_rect.height() < 1.0 {
             return output;
         }
@@ -335,6 +339,10 @@ impl BoardView {
         let painter = ui.painter_at(canvas_rect);
         painter.rect_filled(canvas_rect, 0, theme::CANVAS_BG);
         paint_grid(&painter, &self.camera, canvas_rect);
+        let hovered_edge = self.hovered_edge(ui, context, &geometry, canvas_rect);
+        if hovered_edge.is_some() {
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        }
         paint_edges(
             &painter,
             context.board,
@@ -342,6 +350,7 @@ impl BoardView {
             &self.camera,
             canvas_rect,
             &self.selected_edges,
+            hovered_edge.as_deref(),
         );
         self.paint_notes(ui, &painter, context, &geometry, canvas_rect, &mut output);
         self.paint_link_hint(ui, context, &geometry, canvas_rect);
@@ -364,6 +373,8 @@ impl BoardView {
                 theme::TEXT_MUTED,
             );
         }
+
+        self.edge_context_menu(context, &geometry, canvas_rect, &background, &mut output);
 
         if self.drag.is_some() || self.pan_button.is_some() {
             ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
@@ -701,7 +712,8 @@ impl BoardView {
             .then_some(id)
     }
 
-    /// The note whose link handle is under the pointer (single selection only).
+    /// The note whose link handle is under the pointer. Handles show on the
+    /// hovered note and on a single selected note; the smallest note wins.
     fn link_handle_at(
         &self,
         geometry: &Geometry,
@@ -709,14 +721,110 @@ impl BoardView {
         pointer: Pos2,
         canvas_rect: Rect,
     ) -> Option<NoteId> {
-        let id = self.single_selected()?;
-        if self.editing.as_ref() == Some(id) {
+        let mut best: Option<(f32, NoteId)> = None;
+        for note in &context.board.notes {
+            if self.editing.as_ref() == Some(&note.id) {
+                continue;
+            }
+            let Some(screen) = geometry.screen_rect(&note.id, &self.camera, canvas_rect) else {
+                continue;
+            };
+            if (pointer - link_handle_center(screen)).length() > LINK_HANDLE_RADIUS * 1.5 {
+                continue;
+            }
+            let area = screen.width() * screen.height();
+            if best.as_ref().is_none_or(|(best, _)| area < *best) {
+                best = Some((area, note.id.clone()));
+            }
+        }
+        best.map(|(_, id)| id)
+    }
+
+    /// The note whose link handle should be drawn: the one under the handle,
+    /// else the innermost note under the pointer.
+    fn handle_owner(
+        &self,
+        ui: &Ui,
+        geometry: &Geometry,
+        context: &BoardContext<'_>,
+        canvas_rect: Rect,
+    ) -> Option<NoteId> {
+        if self.drag.is_some() || self.link.is_some() || self.marquee.is_some() {
             return None;
         }
-        context.board.note(id)?;
-        let screen = geometry.screen_rect(id, &self.camera, canvas_rect)?;
-        let center = link_handle_center(screen);
-        ((pointer - center).length() <= LINK_HANDLE_RADIUS * 1.5).then(|| id.clone())
+        let pointer = ui.input(|input| input.pointer.hover_pos())?;
+        if !on_board_layer(ui, pointer) {
+            return None;
+        }
+        self.link_handle_at(geometry, context, pointer, canvas_rect)
+            .or_else(|| self.hit_note(geometry, context, pointer, canvas_rect))
+    }
+
+    /// The arrow under the pointer, when no note is.
+    fn hovered_edge(
+        &self,
+        ui: &Ui,
+        context: &BoardContext<'_>,
+        geometry: &Geometry,
+        canvas_rect: Rect,
+    ) -> Option<EdgeId> {
+        if self.drag.is_some() || self.link.is_some() || self.marquee.is_some() {
+            return None;
+        }
+        let pointer = ui.input(|input| input.pointer.hover_pos())?;
+        if !canvas_rect.contains(pointer)
+            || !on_board_layer(ui, pointer)
+            || self
+                .hit_note(geometry, context, pointer, canvas_rect)
+                .is_some()
+        {
+            return None;
+        }
+        hit_edge(context.board, geometry, &self.camera, canvas_rect, pointer)
+    }
+
+    /// Right-click on an arrow opens a small menu for it.
+    fn edge_context_menu(
+        &mut self,
+        context: &BoardContext<'_>,
+        geometry: &Geometry,
+        canvas_rect: Rect,
+        background: &egui::Response,
+        output: &mut BoardOutput,
+    ) {
+        if background.secondary_clicked()
+            && let Some(pointer) = background.interact_pointer_pos()
+            && self
+                .hit_note(geometry, context, pointer, canvas_rect)
+                .is_none()
+        {
+            self.edge_menu = hit_edge(context.board, geometry, &self.camera, canvas_rect, pointer);
+            if let Some(edge) = &self.edge_menu {
+                self.selected.clear();
+                self.selected_edges = vec![edge.clone()];
+            }
+        }
+        let Some(edge) = self.edge_menu.clone() else {
+            return;
+        };
+        let mut delete = false;
+        let shown = background.context_menu(|ui| {
+            if ui
+                .button(RichText::new("Delete link").color(theme::SAVE_ERROR))
+                .on_hover_text("Delete or Backspace")
+                .clicked()
+            {
+                delete = true;
+                ui.close();
+            }
+        });
+        if delete && context.board.edge(&edge).is_some() {
+            output.commands.push(Command::Unlink { edge_id: edge });
+            self.selected_edges.clear();
+            self.edge_menu = None;
+        } else if shown.is_none() {
+            self.edge_menu = None;
+        }
     }
 
     fn has_editor_focus(&self, ui: &Ui) -> bool {
@@ -984,6 +1092,7 @@ impl BoardView {
         canvas_rect: Rect,
         output: &mut BoardOutput,
     ) {
+        let handle_owner = self.handle_owner(ui, geometry, context, canvas_rect);
         // Containers paint first so their children are drawn on top.
         let mut order: Vec<&Note> = context.board.notes.iter().collect();
         order.sort_by_key(|note| !geometry.is_container(&note.id));
@@ -1156,7 +1265,9 @@ impl BoardView {
                         ui.ctx().request_repaint();
                     }
                 }
-            } else if self.single_selected().map(String::as_str) == Some(note.id.as_str()) {
+            } else if self.single_selected().map(String::as_str) == Some(note.id.as_str())
+                || handle_owner.as_deref() == Some(note.id.as_str())
+            {
                 let center = link_handle_center(screen);
                 painter.circle_filled(center, LINK_HANDLE_RADIUS, dim(theme::ACCENT, opacity));
                 let hovered = ui
@@ -1373,19 +1484,48 @@ impl BoardView {
         }
     }
 
+    /// While linking, draw a live arrow from the source to the pointer and
+    /// outline the note it would link to.
     fn paint_link_hint(
         &self,
         ui: &mut Ui,
-        _context: &BoardContext<'_>,
-        _geometry: &Geometry,
-        _canvas_rect: Rect,
+        context: &BoardContext<'_>,
+        geometry: &Geometry,
+        canvas_rect: Rect,
     ) {
-        // The line follows the pointer while a link drag is active.
-        if self.link.is_none() {
+        let Some(link) = &self.link else {
             return;
-        }
+        };
         ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
         ui.ctx().request_repaint();
+        let Some(pointer) = ui.input(|input| input.pointer.hover_pos()) else {
+            return;
+        };
+        let Some(source) = geometry.screen_rect(&link.from, &self.camera, canvas_rect) else {
+            return;
+        };
+        let painter = ui.painter_at(canvas_rect);
+        let target = self
+            .hit_note(geometry, context, pointer, canvas_rect)
+            .filter(|target| *target != link.from);
+        let end = match target
+            .as_ref()
+            .and_then(|target| geometry.screen_rect(target, &self.camera, canvas_rect))
+        {
+            Some(rect) => {
+                painter.rect_stroke(
+                    rect.expand(3.0),
+                    theme::CARD_CORNER,
+                    Stroke::new(2.0, theme::ACCENT),
+                    StrokeKind::Outside,
+                );
+                border_point(rect, link_handle_center(source))
+            }
+            None => pointer,
+        };
+        let start = link_handle_center(source);
+        painter.line_segment([start, end], Stroke::new(2.0, theme::ACCENT));
+        paint_arrowhead(&painter, end, start, theme::ACCENT);
     }
 }
 
@@ -1755,6 +1895,7 @@ fn paint_edges(
     camera: &Camera,
     canvas_rect: Rect,
     selected: &[EdgeId],
+    hovered: Option<&str>,
 ) {
     for edge in &board.edges {
         let Some(from) = geometry.num(&edge.from) else {
@@ -1768,8 +1909,11 @@ fn paint_edges(
         };
         let points = edge_screen_points(&bezier, camera, canvas_rect);
         let is_selected = selected.contains(&edge.id);
+        let is_hovered = hovered == Some(edge.id.as_str());
         let color = if is_selected {
             theme::ACCENT
+        } else if is_hovered {
+            theme::TEXT_PRIMARY
         } else {
             theme::TEXT_MUTED
         };
@@ -1777,7 +1921,7 @@ fn paint_edges(
             [points[0], points[1], points[2], points[3]],
             false,
             Color32::TRANSPARENT,
-            Stroke::new(if is_selected { 2.5 } else { 1.5 }, color),
+            Stroke::new(if is_selected || is_hovered { 2.5 } else { 1.5 }, color),
         ));
         paint_arrowhead(painter, points[3], points[2], color);
     }
@@ -2056,9 +2200,30 @@ fn toggle_done_commands(board: &Board, targets: &[NoteId]) -> Vec<Command> {
     }
 }
 
-/// Centre of the link handle drawn on a selected note's right edge.
+/// Centre of the link handle: on the note's right border, half outside the
+/// card so it never covers the text.
 fn link_handle_center(screen: Rect) -> Pos2 {
-    pos2(screen.right() - 16.0, screen.center().y)
+    pos2(screen.right(), screen.center().y)
+}
+
+/// Where the line from `rect`'s centre towards `from` crosses its border.
+fn border_point(rect: Rect, from: Pos2) -> Pos2 {
+    let center = rect.center();
+    let direction = from - center;
+    if direction.length_sq() <= f32::EPSILON {
+        return center;
+    }
+    let scale_x = if direction.x.abs() > f32::EPSILON {
+        (rect.width() * 0.5) / direction.x.abs()
+    } else {
+        f32::INFINITY
+    };
+    let scale_y = if direction.y.abs() > f32::EPSILON {
+        (rect.height() * 0.5) / direction.y.abs()
+    } else {
+        f32::INFINITY
+    };
+    center + direction * scale_x.min(scale_y).min(1.0)
 }
 
 fn first_line(text: &str) -> &str {
