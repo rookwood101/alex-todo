@@ -642,6 +642,24 @@ fn dragging_a_leaf_handle_onto_another_note_links_them() {
 }
 
 #[test]
+fn ctrl_d_opens_the_due_popover_and_a_quick_pick_sets_due_and_reminder() {
+    let mut headless = Headless::new("app-due-popover");
+    add_note(&mut headless.app, "task");
+    headless.run_frame(Vec::new());
+    let id = headless.note_ids()[0].clone();
+    headless.app.view.select_only(id.clone());
+    headless.key_with(Key::D, CTRL);
+    headless.run_frame(Vec::new());
+    headless.type_text("tomorrow 4pm");
+    headless.key(Key::Enter);
+    let note = headless.app.board.note(&id).expect("note").clone();
+    let due = note.due.expect("due set from the popover");
+    assert!(due.local.ends_with("T16:00:00"), "{}", due.local);
+    assert_eq!(note.remind, Some(due), "the reminder follows the due date");
+    assert!(!headless.app.view.is_editing());
+}
+
+#[test]
 fn an_invalid_config_falls_back_to_defaults() {
     let paths = StorePaths::from_home(scratch_dir("app-config"));
     std::fs::create_dir_all(paths.home()).expect("home");
